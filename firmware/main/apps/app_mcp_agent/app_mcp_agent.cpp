@@ -154,18 +154,17 @@ void AppMcpAgent::refresh_ip_hint()
     // Be honest on screen: an IP without a listener is worse than no hint.
     if (!st.running) {
         _label_ip_hint->setText("service failed");
-        _wifi_perf_applied = false;
         return;
     }
     // The LAN server must stay reachable: without this the default Wi-Fi
     // modem sleep makes the device miss ARP within a minute of idling.
+    // Re-assert every 5 s while connected — a Wi-Fi drop/reconnect silently
+    // restores the power-save default, and a set-once flag misses that.
     if (!st.ip.empty() && st.ip != "0.0.0.0") {
-        if (!_wifi_perf_applied) {
+        if (now - _last_ps_ms > 5000) {
+            _last_ps_ms = now;
             mcp_dev::wifi_set_no_power_save();
-            _wifi_perf_applied = true;
         }
-    } else {
-        _wifi_perf_applied = false;  // re-apply after a reconnect
     }
     // The hint has served its purpose once a client found the server.
     if (st.requests > 0) {
