@@ -66,6 +66,12 @@ void AppMcpAgent::onOpen()
         // head makes the face blush with hearts and a happy wiggle, then
         // returns to normal after a few seconds.
         GetStackChan().addModifier(std::make_unique<HeadPetModifier>());
+        // Gesture observability: every head-pet gesture shows up in the
+        // service event line (GET / last_event) — separates "touch not
+        // detected" from "modifier not reacting".
+        _pet_conn = GetHAL().onHeadPetGesture.connect([](HeadPetGesture g) {
+            mcp_lan::service_push_event("headpet gesture %d", (int)g);
+        });
 
         // Common widgets (status bar + home indicator at the bottom to exit)
         view::create_home_indicator([&]() { close(); }, _theme_color, _theme_color_dark);
@@ -140,6 +146,10 @@ void AppMcpAgent::onClose()
 
         GetStackChan().resetAvatar();
 
+        if (_pet_conn != 0) {
+            GetHAL().onHeadPetGesture.disconnect(_pet_conn);
+            _pet_conn = 0;
+        }
         _label_ip_hint.reset();
 
         view::destroy_home_indicator();

@@ -28,6 +28,7 @@ private:
     void refresh_ip_hint();
 
     std::unique_ptr<uitk::lvgl_cpp::Label> _label_ip_hint;
+    unsigned _pet_conn = 0;  // head-pet gesture observability connection
     uint32_t _last_refresh_ms = 0;
     uint32_t _last_ps_ms      = 0;
 };

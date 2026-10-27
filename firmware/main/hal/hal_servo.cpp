@@ -41,6 +41,15 @@ public:
         reset_runtime_limits();
         set_angle_limit(_config.angleLimit);
         get_zero_pos_from_nvs();
+        if (_config.enablePwmMode) {
+            // Normalize the servo's stored mode. check_mode() compares
+            // against its RAM state only, so a servo left in PWM mode
+            // (factory reset, prior rotate() use) silently ignores every
+            // position write. A PWM pass caches the angle limits, the
+            // return pass restores position mode.
+            check_mode(Mode::PWM);
+            check_mode(Mode::Position);
+        }
         Servo::init();
     }
 
