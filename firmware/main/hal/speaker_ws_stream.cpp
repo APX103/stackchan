@@ -276,9 +276,10 @@ bool SpeakerWsStream::EnsurePlaybackTask() {
     }
     running_     = true;
     task_exited_ = false;
-    // 12 KB internal stack (tuned via the spk_stack_free telemetry on GET /);
+    // 16 KB internal stack (decode is lighter than encode; telemetry on
+    // GET /);
     // BYTES with WithCaps; must not be PSRAM (flash-write cache assert).
-    if (xTaskCreatePinnedToCoreWithCaps(PlaybackTask, "spk_ws", 2048 * 6, this, 4, &playback_task_, 1,
+    if (xTaskCreatePinnedToCoreWithCaps(PlaybackTask, "spk_ws", 2048 * 8, this, 4, &playback_task_, 1,
                                         MALLOC_CAP_INTERNAL) != pdPASS) {
         ESP_LOGE(TAG, "failed to create playback task (out of internal RAM?)");
         playback_task_ = nullptr;
