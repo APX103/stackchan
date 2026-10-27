@@ -35,6 +35,7 @@ extern "C" void app_main(void)
         GetMooncake().installApp(std::make_unique<AppAiAgent>());
 #if CONFIG_MCP_AGENT_ENABLE
         GetMooncake().installApp(std::make_unique<AppMcpAgent>());
+        GetMooncake().installApp(std::make_unique<AppAudioTest>());
 #endif
         GetMooncake().installApp(std::make_unique<AppAvatar>());
         GetMooncake().installApp(std::make_unique<AppEspnowControl>());

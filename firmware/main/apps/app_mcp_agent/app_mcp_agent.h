@@ -23,11 +23,10 @@ public:
     void onClose() override;
 
 private:
-    // Refreshes the status labels (rate-limited inside).
-    void refresh_labels();
+    // Keeps the small bottom IP hint fresh (rate-limited inside). The avatar
+    // itself stays clean — all diagnostics live on GET / and the serial log.
+    void refresh_ip_hint();
 
-    std::unique_ptr<uitk::lvgl_cpp::Label> _label_url;
-    std::unique_ptr<uitk::lvgl_cpp::Label> _label_status;
-    std::unique_ptr<uitk::lvgl_cpp::Label> _label_event;
+    std::unique_ptr<uitk::lvgl_cpp::Label> _label_ip_hint;
     uint32_t _last_refresh_ms = 0;
 };

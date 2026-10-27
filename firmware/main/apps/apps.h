@@ -7,6 +7,7 @@
 #include "app_launcher/app_launcher.h"
 #include "app_ai_agent/app_ai_agent.h"
 #include "app_mcp_agent/app_mcp_agent.h"
+#include "app_audio_test/app_audio_test.h"
 #include "app_avatar/app_avatar.h"
 #include "app_setup/app_setup.h"
 #include "app_espnow_ctrl/app_espnow_ctrl.h"

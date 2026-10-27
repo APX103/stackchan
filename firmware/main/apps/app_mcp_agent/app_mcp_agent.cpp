@@ -43,8 +43,9 @@ void AppMcpAgent::onCreate()
 
 // Standalone MCP server app: shows the same StackChan face the AI Agent app
 // uses, but never starts the xiaozhi application — no voice chat, no cloud
-// connection, no autonomous behavior. Nothing moves on its own; the robot
-// only acts on tools/call requests from http://<device-ip>:<port>/mcp.
+// connection, no autonomous behavior. The face stays clean and cute; the
+// only on-screen hint is a small dim "ip:port" line at the bottom edge.
+// Full diagnostics live on GET / and the serial log.
 void AppMcpAgent::onOpen()
 {
     mclog::tagInfo(getAppInfo().name, "on open");
@@ -70,24 +71,13 @@ void AppMcpAgent::onOpen()
         view::create_home_indicator([&]() { close(); }, _theme_color, _theme_color_dark);
         view::create_status_bar(_theme_color, _theme_color_dark);
 
-        // Status page
-        _label_url = std::make_unique<Label>(lv_screen_active());
-        _label_url->setTextFont(&lv_font_montserrat_16);
-        _label_url->setTextColor(lv_color_hex(0xFFFFFF));
-        _label_url->align(LV_ALIGN_CENTER, 0, -34);
-        _label_url->setText("starting...");
-
-        _label_status = std::make_unique<Label>(lv_screen_active());
-        _label_status->setTextFont(&lv_font_montserrat_14);
-        _label_status->setTextColor(lv_color_hex(0xFFFFFF));
-        _label_status->align(LV_ALIGN_CENTER, 0, -6);
-        _label_status->setText("");
-
-        _label_event = std::make_unique<Label>(lv_screen_active());
-        _label_event->setTextFont(&lv_font_montserrat_14);
-        _label_event->setTextColor(lv_color_hex(0x9FB4D8));
-        _label_event->align(LV_ALIGN_CENTER, 0, 22);
-        _label_event->setText("");
+        // The only hint: a small dim "ip:port" at the bottom edge so a LAN
+        // client knows where to connect. Nothing else covers the face.
+        _label_ip_hint = std::make_unique<Label>(lv_screen_active());
+        _label_ip_hint->setTextFont(&lv_font_montserrat_14);
+        _label_ip_hint->setTextColor(lv_color_hex(0x8899AA));
+        _label_ip_hint->align(LV_ALIGN_BOTTOM_MID, 0, -30);
+        _label_ip_hint->setText("");
     }
 
     // Bring Wi-Fi up if needed (same flow as the App Center), then serve.
@@ -95,7 +85,8 @@ void AppMcpAgent::onOpen()
         std::unique_ptr<view::LoadingPage> loading_page;
         {
             LvglLockGuard lock;
-            loading_page = std::make_unique<view::LoadingPage>(_theme_color, _theme_color_dark);        }
+            loading_page = std::make_unique<view::LoadingPage>(_theme_color, _theme_color_dark);
+        }
         GetHAL().startNetwork([&](std::string_view msg) {
             LvglLockGuard lock;
             loading_page->setMessage(msg);
@@ -110,12 +101,11 @@ void AppMcpAgent::onOpen()
     if (!mcp_lan::service_start(&err)) {
         mclog::tagError(getAppInfo().name, "service start failed: {}", err);
         LvglLockGuard lock;
-        _label_url->setText("start failed");
-        _label_status->setText(err.c_str());
+        _label_ip_hint->setText("start failed");
         return;
     }
     _last_refresh_ms = 0;
-    refresh_labels();
+    refresh_ip_hint();
 }
 
 void AppMcpAgent::onRunning()
@@ -128,7 +118,7 @@ void AppMcpAgent::onRunning()
         view::update_home_indicator();
         view::update_status_bar();
 
-        refresh_labels();
+        refresh_ip_hint();
     }
 }
 
@@ -145,37 +135,27 @@ void AppMcpAgent::onClose()
 
         GetStackChan().resetAvatar();
 
-        _label_url.reset();
-        _label_status.reset();
-        _label_event.reset();
+        _label_ip_hint.reset();
 
         view::destroy_home_indicator();
         view::destroy_status_bar();
     }
 }
 
-void AppMcpAgent::refresh_labels()
+void AppMcpAgent::refresh_ip_hint()
 {
     const uint32_t now = GetHAL().millis();
-    if (now - _last_refresh_ms < 500) {
+    if (now - _last_refresh_ms < 1000) {
         return;
     }
     _last_refresh_ms = now;
 
-    auto st = mcp_lan::service_status();
-    if (st.ip.empty() || st.ip == "0.0.0.0") {
-        _label_url->setText("offline");
-    } else {
-        char url[48];
-        snprintf(url, sizeof(url), "http://%s:%d/mcp", st.ip.c_str(), st.port);
-        _label_url->setText(url);
+    const std::string ip = mcp_dev::wifi_ip();
+    if (ip.empty() || ip == "0.0.0.0") {
+        _label_ip_hint->setText("");
+        return;
     }
-
-    char status[96];
-    snprintf(status, sizeof(status), "tools:%u calls:%u err:%u  mic:%c spk:%c  heap:%uk",
-             (unsigned)st.tools, (unsigned)st.tool_calls, (unsigned)st.tool_errors, st.mic_active ? '+' : '-',
-             st.spk_active ? '+' : '-', (unsigned)(esp_get_free_heap_size() / 1024));
-    _label_status->setText(status);
-
-    _label_event->setText(st.last_event.c_str());
+    char hint[28];
+    snprintf(hint, sizeof(hint), "%s:%d", ip.c_str(), CONFIG_MCP_AGENT_PORT);
+    _label_ip_hint->setText(hint);
 }

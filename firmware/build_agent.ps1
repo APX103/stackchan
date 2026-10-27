@@ -1,7 +1,8 @@
 # StackChan firmware build script (agent/CI helper)
-# Usage: powershell -ExecutionPolicy Bypass -File build_agent.ps1 [build|flash|monitor|fullclean]
+# Usage: powershell -ExecutionPolicy Bypass -File build_agent.ps1 [-Target build|flash|monitor|fullclean] [-Port COM26]
 param(
-    [string]$Target = "build"
+    [string]$Target = "build",
+    [string]$Port = ""
 )
 $ErrorActionPreference = "Continue"
 Remove-Item Env:MSYSTEM -ErrorAction SilentlyContinue
@@ -10,7 +11,9 @@ $env:IDF_TOOLS_PATH = 'D:\Espressif'
 & 'D:\Espressif\frameworks\esp-idf-v5.5.5\export.ps1'
 if ($?) {
     Set-Location $PSScriptRoot
-    python 'D:\Espressif\frameworks\esp-idf-v5.5.5\tools\idf.py' $Target
+    $extra = @()
+    if ($Port) { $extra = @("-p", $Port) }
+    python 'D:\Espressif\frameworks\esp-idf-v5.5.5\tools\idf.py' @extra $Target
     exit $LASTEXITCODE
 }
 exit 1
