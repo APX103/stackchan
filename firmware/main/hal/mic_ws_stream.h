@@ -63,6 +63,9 @@ private:
 
     static esp_err_t WsHandler(httpd_req_t* req);
     static void CaptureTask(void* arg);
+    // Creates the capture task on the first client "start" (lazy: the stack
+    // is only held while somebody streams). False when out of memory.
+    bool EnsureCaptureTask();
 
     httpd_handle_t server_ = nullptr;
     TaskHandle_t capture_task_ = nullptr;

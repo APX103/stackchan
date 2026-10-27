@@ -65,6 +65,8 @@ void MicWsStream::ReleaseClient(int fd) {
     int current = self.client_fd_.load();
     if (current == fd) {
         self.client_fd_.compare_exchange_strong(current, -1);
+        // The capture task notices the lost claim and parks itself after an
+        // idle grace period (its 24 KB stack returns to the heap then).
         ESP_LOGI(TAG, "client fd %d released", fd);
     }
 }
@@ -115,6 +117,12 @@ esp_err_t MicWsStream::WsHandler(httpd_req_t* req) {
     if (strstr(msg, "\"start\"") != nullptr) {
         int expected = -1;
         if (self.client_fd_.compare_exchange_strong(expected, fd)) {
+            // Create the capture task on demand — its stack is only worth
+            // holding while a client actually streams.
+            if (!self.EnsureCaptureTask()) {
+                self.client_fd_ = -1;
+                return wsutil::SendError(req, "no memory for capture task");
+            }
             ESP_LOGI(TAG, "client fd %d started streaming", fd);
             mcp_lan::service_push_event("mic: client started");
             static const char* kHello =
@@ -243,12 +251,19 @@ void MicWsStream::CaptureTask(void* arg) {
     uint32_t stat_produced = 0;
     uint32_t stat_frames   = 0;
 
+    int idle_ticks = 0;
     while (self.running_) {
         const int fd = self.client_fd_;
         if (fd < 0) {
+            // No client: after the idle grace the task parks itself and its
+            // stack returns to the heap (recreated on the next "start").
+            if (++idle_ticks >= 30) {
+                break;
+            }
             vTaskDelay(pdMS_TO_TICKS(100));  // idle, no client
             continue;
         }
+        idle_ticks = 0;
 
         // Blocks until the codec delivers a chunk (~60 ms) — natural pacing.
         if (!codec->InputData(in_buf)) {
@@ -356,21 +371,10 @@ bool MicWsStream::Start(httpd_handle_t server) {
     if (server_ != nullptr) {
         return true;  // already running
     }
-    server_       = server;
-    running_      = true;
-    task_exited_  = false;
-    // 24 KB internal stack. WithCaps takes the depth in BYTES; the stack
-    // must stay in INTERNAL RAM: flash writes (NVS etc.) briefly disable
-    // the cache, and a task executing on a PSRAM stack hits
-    // "assert failed: esp_task_stack_is_sane_cache_disabled" and reboots.
-    if (xTaskCreatePinnedToCoreWithCaps(CaptureTask, "mic_ws", 2048 * 12, this, 4, &capture_task_, 1,
-                                        MALLOC_CAP_INTERNAL) != pdPASS) {
-        ESP_LOGE(TAG, "failed to create capture task");
-        running_ = false;
-        server_  = nullptr;
-        return false;
-    }
-
+    server_ = server;
+    // The capture task is created lazily on the first client "start" (see
+    // WsHandler): its 24 KB stack must not sit in the heap while nobody
+    // streams — internal RAM is the scarcest resource on this board.
     httpd_uri_t ws_mic              = {};
     ws_mic.uri                      = "/mic";
     ws_mic.method                   = HTTP_GET;
@@ -379,10 +383,36 @@ bool MicWsStream::Start(httpd_handle_t server) {
     ws_mic.handle_ws_control_frames = false;
     if (httpd_register_uri_handler(server_, &ws_mic) != ESP_OK) {
         ESP_LOGE(TAG, "failed to register /mic ws handler");
-        Stop();
+        server_ = nullptr;
         return false;
     }
     ESP_LOGI(TAG, "microphone stream ready at ws://<device-ip>:%d/mic", CONFIG_MCP_AGENT_PORT);
+    return true;
+}
+
+bool MicWsStream::EnsureCaptureTask() {
+    // Clean up a previously parked task first (its stack is still held
+    // until deleted with WithCaps semantics).
+    if (capture_task_ != nullptr && task_exited_.load()) {
+        vTaskDeleteWithCaps(capture_task_);
+        capture_task_ = nullptr;
+    }
+    if (capture_task_ != nullptr) {
+        return true;
+    }
+    running_     = true;
+    task_exited_ = false;
+    // 24 KB internal stack. WithCaps takes the depth in BYTES; the stack
+    // must stay in INTERNAL RAM: flash writes (NVS etc.) briefly disable
+    // the cache, and a task executing on a PSRAM stack hits
+    // "assert failed: esp_task_stack_is_sane_cache_disabled" and reboots.
+    if (xTaskCreatePinnedToCoreWithCaps(CaptureTask, "mic_ws", 2048 * 12, this, 4, &capture_task_, 1,
+                                        MALLOC_CAP_INTERNAL) != pdPASS) {
+        ESP_LOGE(TAG, "failed to create capture task (out of internal RAM?)");
+        capture_task_ = nullptr;
+        running_      = false;
+        return false;
+    }
     return true;
 }
 

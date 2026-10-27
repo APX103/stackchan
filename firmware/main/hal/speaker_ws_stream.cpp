@@ -57,6 +57,9 @@ void SpeakerWsStream::PlaybackTask(void* arg) {
     uint32_t played = 0;
     int decode_errs = 0;
 
+    // Decoder is opened lazily on the first packet; the task parks itself
+    // after ~3 s without a client, returning its stack to the heap.
+    int idle_ticks = 0;
     while (self.running_) {
         std::shared_ptr<std::vector<uint8_t>> packet;
         {
@@ -67,8 +70,12 @@ void SpeakerWsStream::PlaybackTask(void* arg) {
                 break;
             }
             if (self.packet_queue_.empty()) {
+                if (self.client_fd_.load() < 0 && ++idle_ticks >= 3) {
+                    break;  // no client, no audio: park and free the stack
+                }
                 continue;  // idle tick: re-check running_
             }
+            idle_ticks = 0;
             packet = std::move(self.packet_queue_.front());
             self.packet_queue_.pop_front();
         }
@@ -183,6 +190,12 @@ esp_err_t SpeakerWsStream::WsHandler(httpd_req_t* req) {
     if (strstr(msg, "\"start\"") != nullptr) {
         int expected = -1;
         if (self.client_fd_.compare_exchange_strong(expected, fd)) {
+            // Playback task is created on demand — its stack is only worth
+            // holding while a client actually streams.
+            if (!self.EnsurePlaybackTask()) {
+                self.client_fd_ = -1;
+                return wsutil::SendError(req, "no memory for playback task");
+            }
             ESP_LOGI(TAG, "client fd %d started playback", fd);
             mcp_lan::service_push_event("speaker: client started");
             {
@@ -225,19 +238,10 @@ bool SpeakerWsStream::Start(httpd_handle_t server) {
     if (server_ != nullptr) {
         return true;  // already running
     }
-    server_      = server;
-    running_     = true;
-    task_exited_ = false;
-    // 24 KB internal stack (BYTES with WithCaps; must not be PSRAM — see
-    // the note in mic_ws_stream.cpp about flash writes and the cache).
-    if (xTaskCreatePinnedToCoreWithCaps(PlaybackTask, "spk_ws", 2048 * 12, this, 4, &playback_task_, 1,
-                                        MALLOC_CAP_INTERNAL) != pdPASS) {
-        ESP_LOGE(TAG, "failed to create playback task");
-        running_ = false;
-        server_  = nullptr;
-        return false;
-    }
-
+    server_ = server;
+    // The playback task is created lazily on the first client "start" (see
+    // WsHandler): its 24 KB stack must not sit in the heap while nobody
+    // streams — internal RAM is the scarcest resource on this board.
     httpd_uri_t ws_speaker              = {};
     ws_speaker.uri                      = "/speaker";
     ws_speaker.method                   = HTTP_GET;
@@ -246,10 +250,33 @@ bool SpeakerWsStream::Start(httpd_handle_t server) {
     ws_speaker.handle_ws_control_frames = false;
     if (httpd_register_uri_handler(server_, &ws_speaker) != ESP_OK) {
         ESP_LOGE(TAG, "failed to register /speaker ws handler");
-        Stop();
+        server_ = nullptr;
         return false;
     }
     ESP_LOGI(TAG, "speaker stream ready at ws://<device-ip>:%d/speaker", CONFIG_MCP_AGENT_PORT);
+    return true;
+}
+
+bool SpeakerWsStream::EnsurePlaybackTask() {
+    // Clean up a previously parked task first.
+    if (playback_task_ != nullptr && task_exited_.load()) {
+        vTaskDeleteWithCaps(playback_task_);
+        playback_task_ = nullptr;
+    }
+    if (playback_task_ != nullptr) {
+        return true;
+    }
+    running_     = true;
+    task_exited_ = false;
+    // 24 KB internal stack (BYTES with WithCaps; must not be PSRAM — see
+    // the note in mic_ws_stream.cpp about flash writes and the cache).
+    if (xTaskCreatePinnedToCoreWithCaps(PlaybackTask, "spk_ws", 2048 * 12, this, 4, &playback_task_, 1,
+                                        MALLOC_CAP_INTERNAL) != pdPASS) {
+        ESP_LOGE(TAG, "failed to create playback task (out of internal RAM?)");
+        playback_task_ = nullptr;
+        running_       = false;
+        return false;
+    }
     return true;
 }
 

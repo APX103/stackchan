@@ -151,6 +151,12 @@ void AppMcpAgent::refresh_ip_hint()
     _last_refresh_ms = now;
 
     auto st = mcp_lan::service_status();
+    // Be honest on screen: an IP without a listener is worse than no hint.
+    if (!st.running) {
+        _label_ip_hint->setText("service failed");
+        _wifi_perf_applied = false;
+        return;
+    }
     // The LAN server must stay reachable: without this the default Wi-Fi
     // modem sleep makes the device miss ARP within a minute of idling.
     if (!st.ip.empty() && st.ip != "0.0.0.0") {

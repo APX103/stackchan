@@ -69,6 +69,9 @@ private:
 
     static esp_err_t WsHandler(httpd_req_t* req);
     static void PlaybackTask(void* arg);
+    // Creates the playback task on the first client "start" (lazy: the
+    // stack is only held while somebody streams). False when out of memory.
+    bool EnsurePlaybackTask();
 
     httpd_handle_t server_ = nullptr;
     TaskHandle_t playback_task_ = nullptr;
