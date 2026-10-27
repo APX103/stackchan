@@ -150,12 +150,18 @@ void AppMcpAgent::refresh_ip_hint()
     }
     _last_refresh_ms = now;
 
-    const std::string ip = mcp_dev::wifi_ip();
+    auto st = mcp_lan::service_status();
+    // The hint has served its purpose once a client found the server.
+    if (st.requests > 0) {
+        _label_ip_hint->setText("");
+        return;
+    }
+    const std::string& ip = st.ip;
     if (ip.empty() || ip == "0.0.0.0") {
         _label_ip_hint->setText("");
         return;
     }
     char hint[28];
-    snprintf(hint, sizeof(hint), "%s:%d", ip.c_str(), CONFIG_MCP_AGENT_PORT);
+    snprintf(hint, sizeof(hint), "%s:%d", ip.c_str(), st.port);
     _label_ip_hint->setText(hint);
 }

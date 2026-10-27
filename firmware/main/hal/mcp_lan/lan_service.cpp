@@ -53,10 +53,11 @@ struct Executor {
 
 struct Stats {
     std::mutex mtx;
-    uint32_t tool_calls  = 0;
-    uint32_t tool_errors = 0;
-    char last_event[96]  = {0};
-    bool reboot_requested = false;
+    uint32_t requests      = 0;
+    uint32_t tool_calls    = 0;
+    uint32_t tool_errors   = 0;
+    char last_event[96]    = {0};
+    bool reboot_requested  = false;
 };
 
 Executor& executor()
@@ -205,6 +206,13 @@ bool service_execute(const std::function<void()>& body, uint32_t timeout_ms)
     return ok;
 }
 
+void service_note_request()
+{
+    auto& s = stats();
+    std::lock_guard<std::mutex> lock(s.mtx);
+    s.requests++;
+}
+
 void service_note_tool_result(bool is_error)
 {
     auto& s = stats();
@@ -284,6 +292,7 @@ ServiceStatus service_status()
     {
         auto& s = stats();
         std::lock_guard<std::mutex> lock(s.mtx);
+        st.requests    = s.requests;
         st.tool_calls  = s.tool_calls;
         st.tool_errors = s.tool_errors;
         st.last_event  = s.last_event;

@@ -20,6 +20,10 @@ def rpc(method, params=None, id=1):
     body = {"jsonrpc": "2.0", "id": id, "method": method}
     if params is not None:
         body["params"] = params
+    return raw_call(body)
+
+
+def raw_call(body):
     req = urllib.request.Request(
         BASE + "/mcp",
         data=json.dumps(body).encode(),
@@ -28,7 +32,8 @@ def rpc(method, params=None, id=1):
     if TOKEN:
         req.add_header("Authorization", "Bearer " + TOKEN)
     with urllib.request.urlopen(req, timeout=40) as resp:
-        return json.loads(resp.read().decode())
+        data = resp.read().decode()
+    return json.loads(data) if data else None
 
 
 def call_tool(name, args=None):
@@ -61,7 +66,8 @@ def main():
     r = rpc("initialize", {"protocolVersion": "2025-03-26", "capabilities": {},
                            "clientInfo": {"name": "smoke", "version": "0"}})
     check("initialize", r["result"]["serverInfo"]["name"] == "stackchan-mcp")
-    rpc("notifications/initialized")  # expect 202, no body
+    # Notifications return 202 with an empty body
+    raw_call({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
     # -- tools/list with pagination --
     names, cursor = [], None
@@ -91,7 +97,7 @@ def main():
     r = call_tool("self.get_system_info")
     check("system_info", not r["result"].get("isError"), r["result"]["content"][0]["text"][:80])
     r = call_tool("self.screen.get_info")
-    check("screen_info", '"width": 320' in r["result"]["content"][0]["text"])
+    check("screen_info", '"width":320' in r["result"]["content"][0]["text"])
 
     # -- display group --
     check("set_emotion happy", not call_tool("self.display.set_emotion", {"emotion": "happy"})["result"].get("isError"))

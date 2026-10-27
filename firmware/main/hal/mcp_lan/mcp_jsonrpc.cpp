@@ -227,6 +227,7 @@ esp_err_t mcp_handler(httpd_req_t* req)
             return send_json(req, body, "401 Unauthorized");
         }
     }
+    service_note_request();
 
     // Read body (capped).
     size_t remaining = req->content_len;

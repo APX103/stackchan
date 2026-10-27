@@ -22,6 +22,7 @@ struct ServiceStatus {
     int port          = 0;
     std::string ip;
     size_t tools      = 0;
+    uint32_t requests    = 0;  // served POST /mcp requests (first one hides the IP hint)
     uint32_t tool_calls  = 0;
     uint32_t tool_errors = 0;
     bool mic_active   = false;
@@ -45,6 +46,7 @@ bool service_execute(const std::function<void()>& body, uint32_t timeout_ms);
 
 // Stats hooks (called from the JSON-RPC layer).
 void service_note_tool_result(bool is_error);
+void service_note_request();
 
 // Record a human-readable event line for the app status page.
 void service_push_event(const char* fmt, ...);
