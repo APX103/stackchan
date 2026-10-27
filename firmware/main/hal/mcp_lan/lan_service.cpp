@@ -315,14 +315,15 @@ bool service_start(std::string* err)
     register_all_tools();
 
     // Tool executor (tools/call bodies run serialized here, never on httpd).
-    // 8 KB stack in PSRAM; WithCaps takes the depth in BYTES.
+    // 8 KB internal stack (BYTES with WithCaps; tool bodies write NVS, so
+    // a PSRAM stack would hit the cache-disabled assert).
     auto& ex = executor();
     ex.running = true;
     static std::atomic<bool> exited{false};
     exited.store(false);
     ex.exited = &exited;
     if (xTaskCreatePinnedToCoreWithCaps(executor_task, "mcp_tool", kExecutorStack, nullptr, 3, &ex.task, 1,
-                                        MALLOC_CAP_SPIRAM) != pdPASS) {
+                                        MALLOC_CAP_INTERNAL) != pdPASS) {
         ex.running = false;
         if (err != nullptr) *err = "failed to create mcp_tool task";
         return false;

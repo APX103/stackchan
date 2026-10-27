@@ -228,9 +228,10 @@ bool SpeakerWsStream::Start(httpd_handle_t server) {
     server_      = server;
     running_     = true;
     task_exited_ = false;
-    // 24 KB stack in PSRAM, depth in BYTES (see the note in mic_ws_stream).
+    // 24 KB internal stack (BYTES with WithCaps; must not be PSRAM — see
+    // the note in mic_ws_stream.cpp about flash writes and the cache).
     if (xTaskCreatePinnedToCoreWithCaps(PlaybackTask, "spk_ws", 2048 * 12, this, 4, &playback_task_, 1,
-                                        MALLOC_CAP_SPIRAM) != pdPASS) {
+                                        MALLOC_CAP_INTERNAL) != pdPASS) {
         ESP_LOGE(TAG, "failed to create playback task");
         running_ = false;
         server_  = nullptr;

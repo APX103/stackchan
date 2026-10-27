@@ -170,9 +170,10 @@ void AppAudioTest::onOpen()
 
     _task_running.store(true);
     _task_exited.store(false);
-    // 24 KB stack in PSRAM; WithCaps takes the depth in BYTES.
+    // 24 KB internal stack (BYTES with WithCaps; must not be PSRAM — see
+    // mic_ws_stream.cpp for the flash-write/cache constraint).
     if (xTaskCreatePinnedToCoreWithCaps(audio_task, "audtest", 2048 * 12, this, 4, &_audio_task_handle, 1,
-                                        MALLOC_CAP_SPIRAM) != pdPASS) {
+                                        MALLOC_CAP_INTERNAL) != pdPASS) {
         ESP_LOGE(TAG, "failed to create audtest task");
         _task_running.store(false);
         _task_exited.store(true);

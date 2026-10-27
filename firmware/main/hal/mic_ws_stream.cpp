@@ -359,11 +359,12 @@ bool MicWsStream::Start(httpd_handle_t server) {
     server_       = server;
     running_      = true;
     task_exited_  = false;
-    // 24 KB stack in PSRAM. NOTE: the WithCaps variants take the depth in
-    // BYTES (the classic xTaskCreate takes words — passing 24 K there meant
-    // 96 KB of internal RAM per task, which is what starved the system).
+    // 24 KB internal stack. WithCaps takes the depth in BYTES; the stack
+    // must stay in INTERNAL RAM: flash writes (NVS etc.) briefly disable
+    // the cache, and a task executing on a PSRAM stack hits
+    // "assert failed: esp_task_stack_is_sane_cache_disabled" and reboots.
     if (xTaskCreatePinnedToCoreWithCaps(CaptureTask, "mic_ws", 2048 * 12, this, 4, &capture_task_, 1,
-                                        MALLOC_CAP_SPIRAM) != pdPASS) {
+                                        MALLOC_CAP_INTERNAL) != pdPASS) {
         ESP_LOGE(TAG, "failed to create capture task");
         running_ = false;
         server_  = nullptr;
