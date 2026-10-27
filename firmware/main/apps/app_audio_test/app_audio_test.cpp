@@ -242,7 +242,8 @@ void AppAudioTest::build_menu_view()
 void AppAudioTest::build_spectrum_view()
 {
     destroy_view();
-    _view_kind = View::Spectrum;
+    _view_kind     = View::Spectrum;
+    _painted_peak  = -1;
 
     _view = lv_obj_create(_root->get());
     lv_obj_set_size(_view, 320, 240);
@@ -314,15 +315,29 @@ void AppAudioTest::on_ui_tick()
 {
     if (_view_kind == View::Spectrum) {
         float targets[kBandCount];
+        int peak_band = -1;
         {
             std::lock_guard<std::mutex> lock(_spec_mtx);
             memcpy(targets, _bands, sizeof(targets));
+            peak_band = _peak_band;
         }
         for (int i = 0; i < kBandCount; i++) {
-            // 50 FPS smoothing toward the (33 Hz) data rate
-            _bar_height[i] += (targets[i] * 150.0f - _bar_height[i]) * 0.55f;
+            // Fast attack, slower decay: transients punch, bars fall smoothly
+            const float t = targets[i] * 150.0f;
+            const float k = t > _bar_height[i] ? 0.7f : 0.30f;
+            _bar_height[i] += (t - _bar_height[i]) * k;
             const float h = std::max(2.0f, _bar_height[i]);
             lv_obj_set_height(_bars[i], (int32_t)h);
+        }
+        // Highlight the dominant band in white (visible while humming a note)
+        if (peak_band != _painted_peak) {
+            for (int i = 0; i < kBandCount; i++) {
+                if (_bars[i] != nullptr) {
+                    lv_obj_set_style_bg_color(_bars[i],
+                                              lv_color_hex(i == peak_band ? 0xFFFFFF : _accent), 0);
+                }
+            }
+            _painted_peak = peak_band;
         }
         const uint32_t now = GetHAL().millis();
         if (now - _last_info_ms > 250) {
@@ -533,14 +548,24 @@ void AppAudioTest::run_spectrum_mode()
                 }
                 const float amp = m / (kFftN / 4.0f);
                 const float db  = 20.0f * log10f(amp + 1.0f);
-                bands[b] = std::min(1.0f, std::max(0.0f, (db - 20.0f) / 60.0f));
+                // 30..78 dB window: narrower than a full dynamic range so a
+                // hummed note's fundamental stands out sharply from the noise
+                // floor around it.
+                bands[b] = std::min(1.0f, std::max(0.0f, (db - 30.0f) / 48.0f));
             }
 
             {
                 std::lock_guard<std::mutex> lock(_spec_mtx);
                 memcpy(_bands, bands, sizeof(bands));
-                _peak_hz = (float)best_bin * rate / kFftN;
-                _peak_db = 20.0f * log10f(best_mag / (kFftN / 4.0f) + 1.0f);
+                int strongest = 0;
+                for (int b = 1; b < kBandCount; b++) {
+                    if (bands[b] > bands[strongest]) {
+                        strongest = b;
+                    }
+                }
+                _peak_band = bands[strongest] > 0.25f ? strongest : -1;
+                _peak_hz   = (float)best_bin * rate / kFftN;
+                _peak_db   = 20.0f * log10f(best_mag / (kFftN / 4.0f) + 1.0f);
             }
         }
     }

@@ -55,6 +55,7 @@ private:
     float _bands[kBandCount] = {0};   // 0..1 per band
     float _peak_hz           = 0;
     float _peak_db           = -100;
+    int _peak_band           = -1;    // dominant band index, -1 when quiet
     std::atomic<int> _task_mode{(int)TaskMode::Idle};
     std::atomic<bool> _task_running{false};
     std::atomic<bool> _task_exited{true};
@@ -69,6 +70,7 @@ private:
     lv_obj_t* _spec_info      = nullptr;
     lv_obj_t* _tone_label     = nullptr;
     float _bar_height[kBandCount] = {0};
+    int _painted_peak            = -1;
     lv_timer_t* _ui_timer     = nullptr;
     View _view_kind           = View::Menu;
     uint32_t _last_info_ms    = 0;
