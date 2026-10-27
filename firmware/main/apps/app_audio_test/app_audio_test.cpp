@@ -458,10 +458,15 @@ void AppAudioTest::run_spectrum_mode()
     codec->EnableOutput(true);
     codec->Start();
 
+    // Warm-up (mirrors the official AudioService): drop the first chunks
+    // after enabling, the codec's power-on transient would dominate them.
     const int rate = codec->input_sample_rate();
-    // 30 ms chunks -> ~33 Hz data rate behind the 50 FPS animation
     const size_t in_chunk = rate / 1000 * 30;   // interleaved stereo
     std::vector<int16_t> in_buf(in_chunk);
+    for (int i = 0; i < 7 && _task_mode.load() == (int)TaskMode::Spectrum; i++) {
+        codec->InputData(in_buf);
+    }
+
     std::vector<float> window(kFftN);
     for (int i = 0; i < kFftN; i++) {
         window[i] = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * i / (kFftN - 1)));  // Hann
@@ -490,14 +495,23 @@ void AppAudioTest::run_spectrum_mode()
         _mic_level.store(std::min(100, peak / 328));
 
         while (mic.size() >= (size_t)kFftN) {
+            // Remove DC before windowing: a DC offset would leak through the
+            // window sidelobes into every band.
+            float mean = 0;
             for (int i = 0; i < kFftN; i++) {
-                re[i] = mic[i] * window[i];
+                mean += mic[i];
+            }
+            mean /= kFftN;
+            for (int i = 0; i < kFftN; i++) {
+                re[i] = (mic[i] - mean) * window[i];
                 im[i] = 0;
             }
             mic.erase(mic.begin(), mic.begin() + kFftN);
             kFft.run(re, im);
 
-            // 32 log-spaced bands, magnitude max -> dB -> 0..1
+            // 32 log-spaced bands. mag/(N/4) is the equivalent sine amplitude
+            // (int16 scale), so dB = 20*log10(amplitude) spans roughly
+            // 20 dB (silence, ~10 counts) .. 80 dB (loud, ~10k counts).
             float bands[kBandCount];
             float best_mag = 0;
             int best_bin   = 0;
@@ -517,15 +531,16 @@ void AppAudioTest::run_spectrum_mode()
                         best_bin = k;
                     }
                 }
-                const float db = 20.0f * log10f(m / (kFftN / 4.0f) + 1e-6f);
-                bands[b] = std::min(1.0f, std::max(0.0f, (db + 70.0f) / 60.0f));
+                const float amp = m / (kFftN / 4.0f);
+                const float db  = 20.0f * log10f(amp + 1.0f);
+                bands[b] = std::min(1.0f, std::max(0.0f, (db - 20.0f) / 60.0f));
             }
 
             {
                 std::lock_guard<std::mutex> lock(_spec_mtx);
                 memcpy(_bands, bands, sizeof(bands));
                 _peak_hz = (float)best_bin * rate / kFftN;
-                _peak_db = 20.0f * log10f(best_mag / (kFftN / 4.0f) + 1e-6f);
+                _peak_db = 20.0f * log10f(best_mag / (kFftN / 4.0f) + 1.0f);
             }
         }
     }
