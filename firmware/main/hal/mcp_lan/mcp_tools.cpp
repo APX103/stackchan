@@ -347,6 +347,10 @@ ToolOutput tool_set_head_angles(const cJSON* args)
 
     LvglLockGuard lock;
     auto& motion = GetStackChan().motion();
+    // Servos boot with torque released (power saving) and ignore position
+    // writes while released — enable torque for the move; the servo stack
+    // auto-releases it again ~200 ms after coming to rest.
+    motion.setTorqueEnabled(true);
     if (pitch != -9999) {
         motion.pitchServo().moveWithSpeed(pitch * 10, speed);
     }
@@ -364,14 +368,18 @@ ToolOutput tool_look_at(const cJSON* args)
     if (!get_double(args, "y", &y, &err, true, 0, -1.0, 1.0)) return err;
 
     LvglLockGuard lock;
-    GetStackChan().motion().lookAtNormalized((float)x, (float)y);
+    auto& motion = GetStackChan().motion();
+    motion.setTorqueEnabled(true);  // servos ignore writes while released
+    motion.lookAtNormalized((float)x, (float)y);
     return ok_text("ok");
 }
 
 ToolOutput tool_go_home(const cJSON*)
 {
     LvglLockGuard lock;
-    GetStackChan().motion().goHome(500);
+    auto& motion = GetStackChan().motion();
+    motion.setTorqueEnabled(true);  // servos ignore writes while released
+    motion.goHome(500);
     return ok_text("ok");
 }
 
