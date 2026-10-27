@@ -8,8 +8,6 @@
 #include <stackchan/stackchan.h>
 #include <smooth_ui_toolkit.hpp>
 #include <mooncake_log.h>
-#include <fmt/format.h>
-#include <string>
 #include <settings.h>
 
 using namespace smooth_ui_toolkit;
@@ -41,32 +39,6 @@ public:
         reset_runtime_limits();
         set_angle_limit(_config.angleLimit);
         get_zero_pos_from_nvs();
-        // Heal a servo stuck in SCS "motor mode": PWMMode() zeroes the
-        // angle-limit EPROM registers (9..12) and in that state the servo
-        // silently IGNORES goal-position writes while torque and reads
-        // keep working. If both limits read as zero, restore the intended
-        // operating range and verify.
-        {
-            const uint8_t id = (uint8_t)_config.id;
-            int lo            = _scs_bus.readRegister(id, SCSCL_MIN_ANGLE_LIMIT_L);
-            int hi            = _scs_bus.readRegister(id, SCSCL_MAX_ANGLE_LIMIT_L);
-            if (lo == 0 && hi == 0) {
-                mclog::tagWarn(_tag, "id: {} in MOTOR MODE (limits 0/0), restoring ({},{}]", id,
-                               _config.rawPosLimit.x, _config.rawPosLimit.y);
-                _scs_bus.unLockEprom(id);
-                vTaskDelay(pdMS_TO_TICKS(20));
-                _scs_bus.writeRegister(id, SCSCL_MIN_ANGLE_LIMIT_L, (uint16_t)_config.rawPosLimit.x);
-                vTaskDelay(pdMS_TO_TICKS(50));  // EPROM commit time between writes
-                _scs_bus.writeRegister(id, SCSCL_MAX_ANGLE_LIMIT_L, (uint16_t)_config.rawPosLimit.y);
-                vTaskDelay(pdMS_TO_TICKS(50));
-                _scs_bus.LockEprom(id);
-                lo = _scs_bus.readRegister(id, SCSCL_MIN_ANGLE_LIMIT_L);
-                hi = _scs_bus.readRegister(id, SCSCL_MAX_ANGLE_LIMIT_L);
-                mclog::tagInfo(_tag, "id: {} limits after restore: ({},{}]", id, lo, hi);
-            } else {
-                mclog::tagInfo(_tag, "id: {} angle limits ok: ({},{}]", id, lo, hi);
-            }
-        }
         Servo::init();
     }
 
@@ -142,21 +114,6 @@ public:
         Servo::setTorqueEnabled(enabled);
         _scs_bus.EnableTorque(_config.id, enabled ? 1 : 0);
         // mclog::tagInfo(_tag, "id: {} set torque: {}", _id, enabled);
-    }
-
-    // Diagnostics for the MCP Agent: everything needed to see why a servo
-    // does (not) move — including the runtime limit the stall protection
-    // shrinks when it (rightly or wrongly) detects a jam.
-    std::string debug_dump(const char* name)
-    {
-        int raw = _scs_bus.ReadPos(_config.id);
-        int lo  = _scs_bus.readRegister((uint8_t)_config.id, SCSCL_MIN_ANGLE_LIMIT_L);
-        int hi  = _scs_bus.readRegister((uint8_t)_config.id, SCSCL_MAX_ANGLE_LIMIT_L);
-        return fmt::format("{}: angle={} limit=({},{}] runtimeRaw=({},{}] cfgRaw=({},{}] rawPos={} torque={} stallProt={} epromLimits=({},{}]",
-                           name, getCurrentAngle(), getAngleLimit().x, getAngleLimit().y,
-                           _runtime_raw_pos_limit.x, _runtime_raw_pos_limit.y, _config.rawPosLimit.x,
-                           _config.rawPosLimit.y, raw, getTorqueEnabled() ? 1 : 0,
-                           _config.enableStallProtection ? 1 : 0, lo, hi);
     }
 
     bool getTorqueEnabled() override
@@ -366,13 +323,7 @@ private:
             return;
         }
 
-        const int ret = _scs_bus.SwitchMode(_config.id, static_cast<uint8_t>(targetMode));
-        if (ret < 0) {
-            // Keep the RAM state so the switch is retried on the next call;
-            // otherwise a lost EPROM write silently desynchronizes us.
-            mclog::tagWarn(_tag, "id: {} SwitchMode({}) failed: {}", _config.id, (int)targetMode, ret);
-            return;
-        }
+        _scs_bus.SwitchMode(_config.id, static_cast<uint8_t>(targetMode));
         _current_mode = targetMode;
     }
 };
@@ -408,29 +359,3 @@ void Hal::servo_init()
 
     GetStackChan().attachMotion(std::move(motion));
 }
-
-// Diagnostics for the MCP Agent (see hal/hal_servo_debug.h). Defined here
-// where the concrete ScsServo type (and its stall-shrunk runtime limits)
-// is visible.
-#include "hal_servo_debug.h"
-#include <stackchan/stackchan.h>
-#include <fmt/format.h>
-
-namespace hal_servo_debug {
-
-static std::string dump_one(Servo& servo, const char* name)
-{
-    auto* scs = dynamic_cast<ScsServo*>(&servo);
-    if (scs == nullptr) {
-        return fmt::format("{}: <unexpected servo type>", name);
-    }
-    return scs->debug_dump(name);
-}
-
-std::string dump()
-{
-    auto& motion = GetStackChan().motion();
-    return dump_one(motion.yawServo(), "yaw") + " " + dump_one(motion.pitchServo(), "pitch");
-}
-
-}  // namespace hal_servo_debug

@@ -10,6 +10,7 @@
 #include <apps/apps.h>
 #include <hal/hal.h>
 #include <hal/mcp_lan/device_access.h>
+#include <hal/mcp_lan/servo_heal.h>
 
 using namespace mooncake;
 using namespace smooth_ui_toolkit;
@@ -19,6 +20,12 @@ extern "C" void app_main(void)
     // Setup logger
     mclog::set_level(mclog::level_info);
     mclog::set_time_format(mclog::time_format_unix_milliseconds);
+
+#if CONFIG_MCP_AGENT_ENABLE
+    // Pre-HAL servo healing (see hal/mcp_lan/servo_heal.h): must run before
+    // Hal::init() opens the servo bus. Keeps the official HAL untouched.
+    mcp_lan::heal_servos_before_hal_init();
+#endif
 
     // HAL init
     GetHAL().init();
