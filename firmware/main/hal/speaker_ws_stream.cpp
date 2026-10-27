@@ -10,6 +10,8 @@
 #endif
 
 #include <esp_log.h>
+#include <esp_heap_caps.h>
+#include <freertos/idf_additions.h>
 #include <sdkconfig.h>
 #include <string.h>
 
@@ -34,7 +36,7 @@ void SpeakerWsStream::PlaybackTask(void* arg) {
     if (codec == nullptr) {
         ESP_LOGE(TAG, "board has no audio codec, speaker stream disabled");
         self.task_exited_ = true;
-        vTaskDelete(nullptr);
+        vTaskDelay(portMAX_DELAY);  // WithCaps tasks must not self-delete
         return;
     }
     // The duplex I2S bus is clocked from the output side and the mic capture
@@ -121,7 +123,8 @@ void SpeakerWsStream::PlaybackTask(void* arg) {
     }
     ESP_LOGI(TAG, "playback task stopped (%u packets played)", (unsigned)played);
     self.task_exited_ = true;
-    vTaskDelete(nullptr);
+    // WithCaps tasks must NOT self-delete: park here, the owner deletes us.
+    vTaskDelay(portMAX_DELAY);
 }
 
 esp_err_t SpeakerWsStream::WsHandler(httpd_req_t* req) {
@@ -221,9 +224,9 @@ bool SpeakerWsStream::Start(httpd_handle_t server) {
     server_      = server;
     running_     = true;
     task_exited_ = false;
-    // 24K stack: opus decode needs at least as much as the encode path on
-    // the /mic side (which runs with 2048*12).
-    if (xTaskCreatePinnedToCore(PlaybackTask, "spk_ws", 2048 * 12, this, 4, &playback_task_, 1) != pdPASS) {
+    // 24 KB stack in PSRAM, depth in BYTES (see the note in mic_ws_stream).
+    if (xTaskCreatePinnedToCoreWithCaps(PlaybackTask, "spk_ws", 2048 * 12, this, 4, &playback_task_, 1,
+                                        MALLOC_CAP_SPIRAM) != pdPASS) {
         ESP_LOGE(TAG, "failed to create playback task");
         running_ = false;
         server_  = nullptr;
@@ -255,15 +258,14 @@ void SpeakerWsStream::Stop() {
     queue_cv_.notify_all();
     if (playback_task_ != nullptr) {
         // The queue wait wakes on running_=false within a second, so the
-        // task normally exits (and closes its decoder) on its own; the
-        // force-delete below is only a backstop.
+        // task normally parks itself quickly; then we free it.
         for (int i = 0; i < 15 && !task_exited_.load(); i++) {
             vTaskDelay(pdMS_TO_TICKS(100));
         }
         if (!task_exited_.load()) {
-            ESP_LOGW(TAG, "playback task did not exit, force-deleting (decoder leaked)");
-            vTaskDelete(playback_task_);
+            ESP_LOGW(TAG, "playback task did not exit in time, force-deleting (decoder leaked)");
         }
+        vTaskDeleteWithCaps(playback_task_);
         playback_task_ = nullptr;
     }
     {

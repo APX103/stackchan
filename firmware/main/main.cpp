@@ -9,6 +9,8 @@
 #include <mooncake.h>
 #include <apps/apps.h>
 #include <hal/hal.h>
+#include <hal/serial_console.h>
+#include <hal/mcp_lan/device_access.h>
 
 using namespace mooncake;
 using namespace smooth_ui_toolkit;
@@ -21,6 +23,18 @@ extern "C" void app_main(void)
 
     // HAL init
     GetHAL().init();
+
+#if CONFIG_MCP_AGENT_ENABLE
+    // Construct the audio codec singleton at boot: it is lazily created on
+    // first use, and when that first use happens late (e.g. the MCP Agent
+    // app opening after Wi-Fi is up) the I2S channel allocation can fail
+    // with NO_MEM (ESP_ERROR_CHECK abort -> reboot loop). See
+    // hal/mcp_lan/device_access.h.
+    mcp_dev::audio_codec_warmup();
+
+    // Head-less launcher control over the USB console (see hal/serial_console.h)
+    hal::start_serial_console();
+#endif
 
     // Setup ui hal
     ui_hal::on_delay([](uint32_t ms) { GetHAL().delay(ms); });

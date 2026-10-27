@@ -29,4 +29,5 @@ private:
 
     std::unique_ptr<uitk::lvgl_cpp::Label> _label_ip_hint;
     uint32_t _last_refresh_ms = 0;
+    bool _wifi_perf_applied   = false;
 };

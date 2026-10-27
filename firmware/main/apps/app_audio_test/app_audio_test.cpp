@@ -6,7 +6,9 @@
 #include "app_audio_test.h"
 
 #include <esp_log.h>
+#include <esp_heap_caps.h>
 #include <freertos/FreeRTOS.h>
+#include <freertos/idf_additions.h>
 #include <freertos/task.h>
 #include <math.h>
 
@@ -168,7 +170,9 @@ void AppAudioTest::onOpen()
 
     _task_running.store(true);
     _task_exited.store(false);
-    if (xTaskCreatePinnedToCore(audio_task, "audtest", 2048 * 12, this, 4, nullptr, 1) != pdPASS) {
+    // 24 KB stack in PSRAM; WithCaps takes the depth in BYTES.
+    if (xTaskCreatePinnedToCoreWithCaps(audio_task, "audtest", 2048 * 12, this, 4, &_audio_task_handle, 1,
+                                        MALLOC_CAP_SPIRAM) != pdPASS) {
         ESP_LOGE(TAG, "failed to create audtest task");
         _task_running.store(false);
         _task_exited.store(true);
@@ -388,6 +392,10 @@ void AppAudioTest::onClose()
     for (int i = 0; i < 15 && !_task_exited.load(); i++) {
         vTaskDelay(pdMS_TO_TICKS(100));
     }
+    if (_audio_task_handle != nullptr) {
+        vTaskDeleteWithCaps(_audio_task_handle);
+        _audio_task_handle = nullptr;
+    }
 
     {
         LvglLockGuard lock;
@@ -588,5 +596,6 @@ void AppAudioTest::audio_task(void* arg)
         }
     }
     self->_task_exited.store(true);
-    vTaskDelete(nullptr);
+    // WithCaps tasks must not self-delete: park, the owner frees us.
+    vTaskDelay(portMAX_DELAY);
 }

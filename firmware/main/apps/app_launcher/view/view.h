@@ -33,6 +33,14 @@ public:
     void init(std::vector<mooncake::AppProps_t> appPorps);
     void update();
 
+    // Serial-remote navigation (same gestures a human makes):
+    // scrollNearby(±1) moves the icon strip one icon; clickCenterIcon
+    // "taps" the centered icon, feeding the same clicked-app dispatch a
+    // real tap uses; centeredAppId reports what is centered (-1 if none).
+    void scrollNearby(int direction);
+    void clickCenterIcon();
+    int centeredAppId();
+
 private:
     std::unique_ptr<uitk::lvgl_cpp::Container> _panel;
     std::vector<std::unique_ptr<uitk::lvgl_cpp::Container>> _icon_panels;
@@ -44,6 +52,8 @@ private:
 
     int _clicked_app_id = -1;
     State_t _state      = STATE_STARTUP;
+    // appID of each icon, parallel to the icon layout order (per set)
+    std::vector<int> _icon_app_ids;
 
     void handle_state_startup();
     void handle_state_normal();

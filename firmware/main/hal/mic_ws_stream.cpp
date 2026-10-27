@@ -10,6 +10,8 @@
 #endif
 
 #include <esp_log.h>
+#include <esp_heap_caps.h>
+#include <freertos/idf_additions.h>
 #include <string.h>
 
 #include <memory>
@@ -150,7 +152,7 @@ void MicWsStream::CaptureTask(void* arg) {
     if (codec == nullptr) {
         ESP_LOGE(TAG, "board has no audio codec, mic stream disabled");
         self.task_exited_ = true;
-        vTaskDelete(nullptr);
+        vTaskDelay(portMAX_DELAY);  // WithCaps tasks must not self-delete
         return;
     }
     codec->EnableInput(true);
@@ -178,7 +180,7 @@ void MicWsStream::CaptureTask(void* arg) {
         if (esp_ae_rate_cvt_open(&rs_cfg, &resampler) != ESP_AUDIO_ERR_OK) {
             ESP_LOGE(TAG, "failed to open resampler %lu->%d", in_rate_config, kOpusSampleRate);
             self.task_exited_ = true;
-            vTaskDelete(nullptr);
+            vTaskDelay(portMAX_DELAY);  // WithCaps tasks must not self-delete
             return;
         }
     }
@@ -203,7 +205,7 @@ void MicWsStream::CaptureTask(void* arg) {
             esp_ae_rate_cvt_close(resampler);
         }
         self.task_exited_ = true;
-        vTaskDelete(nullptr);
+        vTaskDelay(portMAX_DELAY);  // WithCaps tasks must not self-delete
         return;
     }
     int frame_bytes = 0;
@@ -334,7 +336,9 @@ void MicWsStream::CaptureTask(void* arg) {
     codec->EnableInput(false);
     ESP_LOGI(TAG, "capture task stopped");
     self.task_exited_ = true;
-    vTaskDelete(nullptr);
+    // WithCaps tasks must NOT self-delete: park here, the owner deletes us
+    // via vTaskDeleteWithCaps once it sees task_exited_.
+    vTaskDelay(portMAX_DELAY);
 }
 
 bool MicWsStream::Start(httpd_handle_t server) {
@@ -347,10 +351,11 @@ bool MicWsStream::Start(httpd_handle_t server) {
     server_       = server;
     running_      = true;
     task_exited_  = false;
-    // 24K stack: esp_opus_enc_process needs far more than the default —
-    // the cloud agent's audio service runs its opus codec task with
-    // 2048*12. 8K overflows on the first encoded frame and aborts.
-    if (xTaskCreatePinnedToCore(CaptureTask, "mic_ws", 2048 * 12, this, 4, &capture_task_, 1) != pdPASS) {
+    // 24 KB stack in PSRAM. NOTE: the WithCaps variants take the depth in
+    // BYTES (the classic xTaskCreate takes words — passing 24 K there meant
+    // 96 KB of internal RAM per task, which is what starved the system).
+    if (xTaskCreatePinnedToCoreWithCaps(CaptureTask, "mic_ws", 2048 * 12, this, 4, &capture_task_, 1,
+                                        MALLOC_CAP_SPIRAM) != pdPASS) {
         ESP_LOGE(TAG, "failed to create capture task");
         running_ = false;
         server_  = nullptr;
@@ -380,16 +385,15 @@ void MicWsStream::Stop() {
     httpd_unregister_uri(server_, "/mic");
     running_ = false;
     if (capture_task_ != nullptr) {
-        // The task exits its loop within one chunk (~60 ms) or one idle
-        // tick (~100 ms) after running_ drops; then it closes its encoder,
-        // releases the input device and sets task_exited_.
+        // The task parks itself (vTaskDelay(portMAX_DELAY)) after setting
+        // task_exited_; once parked it is safe for this task to free it.
         for (int i = 0; i < 15 && !task_exited_.load(); i++) {
             vTaskDelay(pdMS_TO_TICKS(100));
         }
         if (!task_exited_.load()) {
-            ESP_LOGW(TAG, "capture task did not exit, force-deleting (encoder leaked)");
-            vTaskDelete(capture_task_);
+            ESP_LOGW(TAG, "capture task did not exit in time, force-deleting (encoder leaked)");
         }
+        vTaskDeleteWithCaps(capture_task_);
         capture_task_ = nullptr;
     }
     server_ = nullptr;

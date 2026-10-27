@@ -24,6 +24,13 @@ namespace mcp_dev {
 // repo). Returns nullptr if the board has none.
 AudioCodec* audio_codec();
 
+// Forces construction of the audio codec singleton NOW. The codec (and its
+// I2S channels + DMA buffers) is created lazily on first use; if that first
+// use happens late in the boot (e.g. the MCP Agent app opening after Wi-Fi
+// is up), the I2S channel allocation fails with NO_MEM and the
+// ESP_ERROR_CHECK inside aborts the whole system. Called once from app_main.
+void audio_codec_warmup();
+
 // The camera singleton (parent repo class, may be nullptr).
 StackChanCamera* camera();
 
@@ -32,5 +39,9 @@ bool wifi_connected();
 std::string wifi_ip();
 std::string wifi_ssid();
 int wifi_rssi();
+// Disables Wi-Fi modem sleep. While a LAN server must stay reachable, the
+// default power save makes the device stop answering ARP within a minute
+// of going idle.
+void wifi_set_no_power_save();
 
 }  // namespace mcp_dev

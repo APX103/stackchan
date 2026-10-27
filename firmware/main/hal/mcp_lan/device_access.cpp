@@ -6,7 +6,10 @@
 #include "device_access.h"
 
 #include <board.h>
+#include <esp_log.h>
+#include <esp_system.h>
 #include <wifi_manager.h>
+#include <wifi_station.h>
 
 namespace mcp_dev {
 
@@ -17,6 +20,13 @@ AudioCodec* audio_codec()
     // CoreS3AudioCodec and this accessor live in this repo, see
     // hal/board/stackchan.cc M5StackCoreS3Board::GetAudioCodec).
     return Board::GetInstance().GetAudioCodec();
+}
+
+void audio_codec_warmup()
+{
+    const auto* codec = audio_codec();
+    ESP_LOGI("McpDev", "audio codec warmup: %s (free heap %u)",
+             codec != nullptr ? "ok" : "missing", (unsigned)esp_get_free_heap_size());
 }
 
 StackChanCamera* camera()
@@ -42,6 +52,11 @@ std::string wifi_ssid()
 int wifi_rssi()
 {
     return WifiManager::GetInstance().GetRssi();
+}
+
+void wifi_set_no_power_save()
+{
+    WifiManager::GetInstance().SetPowerSaveLevel(WifiPowerSaveLevel::PERFORMANCE);
 }
 
 }  // namespace mcp_dev

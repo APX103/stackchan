@@ -5,6 +5,7 @@
  */
 #include "app_launcher.h"
 #include <hal/hal.h>
+#include <hal/serial_console.h>
 #include <mooncake.h>
 #include <mooncake_log.h>
 #include <stackchan/stackchan.h>
@@ -49,6 +50,27 @@ void AppLauncher::onLauncherRunning()
             create_launcher_view();
         }
     } else {
+        // Serial-remote navigation (mimics a human: scroll / tap)
+        if (_view) {
+            const int nav = hal::launcherNavRequest().exchange(0);
+            if (nav == 1) {
+                _view->scrollNearby(1);
+            } else if (nav == 2) {
+                _view->scrollNearby(-1);
+            } else if (nav == 3) {
+                _view->clickCenterIcon();
+            } else if (nav == 4) {
+                const int id = _view->centeredAppId();
+                for (const auto& props : getAppProps()) {
+                    if (props.appID == id) {
+                        printf("PAGE: %d %s\n", id, props.info.name.c_str());
+                        fflush(stdout);
+                        break;
+                    }
+                }
+            }
+        }
+
         _view->update();
         screensaver_update();
     }

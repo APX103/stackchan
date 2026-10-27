@@ -6,9 +6,10 @@
 #include "lan_service.h"
 
 #include <esp_log.h>
-#include <esp_timer.h>
 #include <esp_heap_caps.h>
+#include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
+#include <freertos/idf_additions.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 #include <sdkconfig.h>
@@ -97,7 +98,8 @@ void executor_task(void*)
     if (ex.exited != nullptr) {
         ex.exited->store(true);
     }
-    vTaskDelete(nullptr);
+    // WithCaps tasks must not self-delete: park, the owner frees us.
+    vTaskDelay(portMAX_DELAY);
 }
 
 struct Pending {
@@ -313,12 +315,14 @@ bool service_start(std::string* err)
     register_all_tools();
 
     // Tool executor (tools/call bodies run serialized here, never on httpd).
+    // 8 KB stack in PSRAM; WithCaps takes the depth in BYTES.
     auto& ex = executor();
     ex.running = true;
     static std::atomic<bool> exited{false};
     exited.store(false);
     ex.exited = &exited;
-    if (xTaskCreatePinnedToCore(executor_task, "mcp_tool", kExecutorStack, nullptr, 3, &ex.task, 1) != pdPASS) {
+    if (xTaskCreatePinnedToCoreWithCaps(executor_task, "mcp_tool", kExecutorStack, nullptr, 3, &ex.task, 1,
+                                        MALLOC_CAP_SPIRAM) != pdPASS) {
         ex.running = false;
         if (err != nullptr) *err = "failed to create mcp_tool task";
         return false;
@@ -387,7 +391,10 @@ void service_stop()
     for (int i = 0; i < 15 && ex.exited != nullptr && !ex.exited->load(); i++) {
         vTaskDelay(pdMS_TO_TICKS(100));
     }
-    ex.task   = nullptr;
+    if (ex.task != nullptr) {
+        vTaskDeleteWithCaps(ex.task);
+        ex.task = nullptr;
+    }
     ex.exited = nullptr;
     service_push_event("service stopped");
     ESP_LOGI(TAG, "MCP Agent service stopped");

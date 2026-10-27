@@ -10,6 +10,8 @@
 #include <uitk/short_namespace.hpp>
 #include <smooth_lvgl.hpp>
 #include <lvgl.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 #include <atomic>
 #include <cstdint>
@@ -59,6 +61,7 @@ private:
     std::atomic<int> _task_mode{(int)TaskMode::Idle};
     std::atomic<bool> _task_running{false};
     std::atomic<bool> _task_exited{true};
+    TaskHandle_t _audio_task_handle = nullptr;
     std::atomic<int> _tone_note{-1};         // index into the scale, -1 = none
     std::atomic<bool> _tones_done{false};
     std::atomic<int> _mic_level{0};          // 0..100, small meter on spectrum view
