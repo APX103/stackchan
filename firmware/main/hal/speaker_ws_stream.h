@@ -61,6 +61,10 @@ public:
         return GetInstance().client_fd_.load() >= 0;
     }
 
+    // Remaining free stack of the playback task in bytes (-1 when not
+    // running) — telemetry for GET /.
+    static int StackHighWaterBytes();
+
 private:
     SpeakerWsStream() = default;
     ~SpeakerWsStream() { Stop(); }

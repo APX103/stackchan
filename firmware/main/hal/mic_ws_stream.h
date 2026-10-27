@@ -50,6 +50,10 @@ public:
         return GetInstance().client_fd_.load() >= 0;
     }
 
+    // Remaining free stack of the capture task in bytes (-1 when not running)
+    // — telemetry for GET / so stack sizes can be tuned from real data.
+    static int StackHighWaterBytes();
+
     // Releases the streaming claim of `fd` (if it is the active client).
     // Called when an async send fails — the only reliable way to notice a
     // client that vanished without a stop frame.

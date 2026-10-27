@@ -257,6 +257,14 @@ bool SpeakerWsStream::Start(httpd_handle_t server) {
     return true;
 }
 
+int SpeakerWsStream::StackHighWaterBytes() {
+    auto& self = GetInstance();
+    if (self.playback_task_ == nullptr) {
+        return -1;
+    }
+    return (int)(uxTaskGetStackHighWaterMark(self.playback_task_) * sizeof(StackType_t));
+}
+
 bool SpeakerWsStream::EnsurePlaybackTask() {
     // Clean up a previously parked task first.
     if (playback_task_ != nullptr && task_exited_.load()) {
@@ -268,9 +276,9 @@ bool SpeakerWsStream::EnsurePlaybackTask() {
     }
     running_     = true;
     task_exited_ = false;
-    // 24 KB internal stack (BYTES with WithCaps; must not be PSRAM — see
-    // the note in mic_ws_stream.cpp about flash writes and the cache).
-    if (xTaskCreatePinnedToCoreWithCaps(PlaybackTask, "spk_ws", 2048 * 12, this, 4, &playback_task_, 1,
+    // 12 KB internal stack (tuned via the spk_stack_free telemetry on GET /);
+    // BYTES with WithCaps; must not be PSRAM (flash-write cache assert).
+    if (xTaskCreatePinnedToCoreWithCaps(PlaybackTask, "spk_ws", 2048 * 6, this, 4, &playback_task_, 1,
                                         MALLOC_CAP_INTERNAL) != pdPASS) {
         ESP_LOGE(TAG, "failed to create playback task (out of internal RAM?)");
         playback_task_ = nullptr;

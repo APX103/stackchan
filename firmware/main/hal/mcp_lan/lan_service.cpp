@@ -137,6 +137,11 @@ esp_err_t status_handler(httpd_req_t* req)
     cJSON_AddNumberToObject(root, "uptime_s", (double)(esp_timer_get_time() / 1000000LL));
     cJSON_AddNumberToObject(root, "free_heap", (double)esp_get_free_heap_size());
     cJSON_AddNumberToObject(root, "free_psram", (double)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    // Internal-RAM telemetry: the scarce resource on this board.
+    cJSON_AddNumberToObject(root, "free_sram", (double)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    cJSON_AddNumberToObject(root, "largest_sram_block", (double)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    cJSON_AddNumberToObject(root, "mic_stack_free", (double)MicWsStream::StackHighWaterBytes());
+    cJSON_AddNumberToObject(root, "spk_stack_free", (double)SpeakerWsStream::StackHighWaterBytes());
     cJSON_AddNumberToObject(root, "tools", (double)st.tools);
     cJSON_AddNumberToObject(root, "tool_calls", (double)st.tool_calls);
     cJSON_AddNumberToObject(root, "tool_errors", (double)st.tool_errors);

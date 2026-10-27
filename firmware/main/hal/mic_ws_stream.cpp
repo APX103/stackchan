@@ -60,6 +60,14 @@ void ws_send_job(void* arg) {
 }
 }  // namespace
 
+int MicWsStream::StackHighWaterBytes() {
+    auto& self = GetInstance();
+    if (self.capture_task_ == nullptr) {
+        return -1;
+    }
+    return (int)(uxTaskGetStackHighWaterMark(self.capture_task_) * sizeof(StackType_t));
+}
+
 void MicWsStream::ReleaseClient(int fd) {
     auto& self = GetInstance();
     int current = self.client_fd_.load();
@@ -402,11 +410,12 @@ bool MicWsStream::EnsureCaptureTask() {
     }
     running_     = true;
     task_exited_ = false;
-    // 24 KB internal stack. WithCaps takes the depth in BYTES; the stack
+    // 16 KB internal stack (tuned via the mic_stack_free telemetry on GET /).
+    // WithCaps takes the depth in BYTES; the stack
     // must stay in INTERNAL RAM: flash writes (NVS etc.) briefly disable
     // the cache, and a task executing on a PSRAM stack hits
     // "assert failed: esp_task_stack_is_sane_cache_disabled" and reboots.
-    if (xTaskCreatePinnedToCoreWithCaps(CaptureTask, "mic_ws", 2048 * 12, this, 4, &capture_task_, 1,
+    if (xTaskCreatePinnedToCoreWithCaps(CaptureTask, "mic_ws", 2048 * 8, this, 4, &capture_task_, 1,
                                         MALLOC_CAP_INTERNAL) != pdPASS) {
         ESP_LOGE(TAG, "failed to create capture task (out of internal RAM?)");
         capture_task_ = nullptr;
