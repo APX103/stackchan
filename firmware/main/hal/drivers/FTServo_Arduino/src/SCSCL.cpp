@@ -227,6 +227,12 @@ int SCSCL::SwitchMode(int ID, u8 mode)
 	if(!angle_limit_cached[servo_id]){
 		return -4;
 	}
+	// Never restore a cached (0,0) pair: that is motor mode (PWMMode zeroes
+	// the limits), restoring it would brick the servo for position control.
+	if(min_angle[servo_id] == 0 && max_angle[servo_id] == 0){
+		min_angle[servo_id] = 0;
+		max_angle[servo_id] = 1023;
+	}
 	if(writeWord(servo_id, SCSCL_MIN_ANGLE_LIMIT_L, (u16)min_angle[servo_id]) != 1){
 		return -5;
 	}
