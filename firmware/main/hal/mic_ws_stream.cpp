@@ -155,12 +155,17 @@ void MicWsStream::CaptureTask(void* arg) {
         vTaskDelay(portMAX_DELAY);  // WithCaps tasks must not self-delete
         return;
     }
-    codec->EnableInput(true);
-    // The duplex I2S bus is clocked from the output side — without the
-    // output device open the ES7210 never gets a BCLK and reads back all
-    // zeroes. Nothing is played here, this only starts the clocks.
-    codec->EnableOutput(true);
-    codec->Start();
+    {
+        // The speaker task initializes its codec side at the same time;
+        // control calls must not interleave (see device_access.h).
+        std::lock_guard<std::mutex> lock(mcp_dev::codec_mutex());
+        codec->EnableInput(true);
+        // The duplex I2S bus is clocked from the output side — without the
+        // output device open the ES7210 never gets a BCLK and reads back all
+        // zeroes. Nothing is played here, this only starts the clocks.
+        codec->EnableOutput(true);
+        codec->Start();
+    }
 
     // The I2S stream is interleaved stereo: slot 0 = microphone, slot 1 =
     // playback reference (measured: [mic, -2, mic, -2...]). Effective mic
@@ -333,7 +338,10 @@ void MicWsStream::CaptureTask(void* arg) {
     if (resampler != nullptr) {
         esp_ae_rate_cvt_close(resampler);
     }
-    codec->EnableInput(false);
+    {
+        std::lock_guard<std::mutex> lock(mcp_dev::codec_mutex());
+        codec->EnableInput(false);
+    }
     ESP_LOGI(TAG, "capture task stopped");
     self.task_exited_ = true;
     // WithCaps tasks must NOT self-delete: park here, the owner deletes us

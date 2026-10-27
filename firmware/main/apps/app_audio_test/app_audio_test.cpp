@@ -429,8 +429,11 @@ void AppAudioTest::run_tones_mode()
     _volume_saved = true;
     GetHAL().setSpeakerVolume(20);  // user-requested test volume
 
-    codec->EnableOutput(true);
-    codec->Start();
+    {
+        std::lock_guard<std::mutex> lock(mcp_dev::codec_mutex());
+        codec->EnableOutput(true);
+        codec->Start();
+    }
 
     const int rate       = codec->output_sample_rate();
     const int note_len   = rate / 1000 * kNoteMs;
@@ -462,7 +465,10 @@ void AppAudioTest::run_tones_mode()
     }
 
     _tone_note.store(-1);
-    codec->EnableOutput(false);
+    {
+        std::lock_guard<std::mutex> lock(mcp_dev::codec_mutex());
+        codec->EnableOutput(false);
+    }
     GetHAL().setSpeakerVolume(_saved_volume);
     _volume_saved = false;
     _tones_done.store(true);
@@ -475,11 +481,14 @@ void AppAudioTest::run_spectrum_mode()
         return;
     }
 
-    codec->EnableInput(true);
-    // The duplex I2S bus is clocked from the output side — opening the output
-    // only starts the clocks, nothing is played (and nothing feeds back).
-    codec->EnableOutput(true);
-    codec->Start();
+    {
+        std::lock_guard<std::mutex> lock(mcp_dev::codec_mutex());
+        codec->EnableInput(true);
+        // The duplex I2S bus is clocked from the output side — opening the output
+        // only starts the clocks, nothing is played (and nothing feeds back).
+        codec->EnableOutput(true);
+        codec->Start();
+    }
 
     // Warm-up (mirrors the official AudioService): drop the first chunks
     // after enabling, the codec's power-on transient would dominate them.
@@ -578,8 +587,11 @@ void AppAudioTest::run_spectrum_mode()
         }
     }
 
-    codec->EnableInput(false);
-    codec->EnableOutput(false);
+    {
+        std::lock_guard<std::mutex> lock(mcp_dev::codec_mutex());
+        codec->EnableInput(false);
+        codec->EnableOutput(false);
+    }
 }
 
 void AppAudioTest::audio_task(void* arg)

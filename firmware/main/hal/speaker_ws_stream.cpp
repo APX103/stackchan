@@ -41,9 +41,12 @@ void SpeakerWsStream::PlaybackTask(void* arg) {
     }
     // The duplex I2S bus is clocked from the output side and the mic capture
     // task already opened it; these calls are idempotent covers for the case
-    // where it has not.
-    codec->EnableOutput(true);
-    codec->Start();
+    // where it has not. Control calls are serialized against the mic task.
+    {
+        std::lock_guard<std::mutex> lock(mcp_dev::codec_mutex());
+        codec->EnableOutput(true);
+        codec->Start();
+    }
 
     // The decoder is opened lazily on the first packet: while the speaker is
     // unused the ~30 KB it needs stay available to the rest of the system.
@@ -119,6 +122,7 @@ void SpeakerWsStream::PlaybackTask(void* arg) {
     // duplex I2S bus is clocked from the output side and the mic capture
     // would read back zeroes without it.
     if (!MicWsStream::IsActive()) {
+        std::lock_guard<std::mutex> lock(mcp_dev::codec_mutex());
         codec->EnableOutput(false);
     }
     ESP_LOGI(TAG, "playback task stopped (%u packets played)", (unsigned)played);

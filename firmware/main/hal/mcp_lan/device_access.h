@@ -5,6 +5,7 @@
  */
 #pragma once
 
+#include <mutex>
 #include <string>
 
 // Hardware facade for the MCP Agent (LAN MCP server).
@@ -23,6 +24,15 @@ namespace mcp_dev {
 // The board's audio codec singleton (CoreS3AudioCodec, implemented in this
 // repo). Returns nullptr if the board has none.
 AudioCodec* audio_codec();
+
+// Serializes all codec CONTROL calls (EnableInput/EnableOutput/Start and
+// friends). The mic and speaker stream tasks initialize their codec sides
+// concurrently after service start; without this lock their I2C register
+// sequences interleave, a codec command fails, and the ESP_ERROR_CHECKs in
+// the codec driver abort the system (observed as a silent reboot with a
+// core dump right after Wi-Fi connects). Data calls (InputData/OutputData)
+// use separate I2S rx/tx channels and do NOT need this lock.
+std::mutex& codec_mutex();
 
 // Forces construction of the audio codec singleton NOW. The codec (and its
 // I2S channels + DMA buffers) is created lazily on first use; if that first

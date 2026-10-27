@@ -13,6 +13,12 @@
 
 namespace mcp_dev {
 
+std::mutex& codec_mutex()
+{
+    static std::mutex mutex;
+    return mutex;
+}
+
 AudioCodec* audio_codec()
 {
     // Single vendored-repo call in the whole MCP Agent feature: the audio
