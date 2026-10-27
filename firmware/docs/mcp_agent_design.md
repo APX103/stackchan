@@ -1,16 +1,20 @@
 # StackChan 局域网 MCP Agent 设计与实现方案
 
-- 版本：v1（待评审）
+- 版本：v1.1（已按评审意见定稿并实现；实现状态见 `mcp_agent_progress.md`）
 - 日期：2026-10-27
-- 基线分支：`feature/parallel-agent`（基于官方 `m5stack/StackChan` @ `eff0d6b`）
+- 基线分支：`feature/parallel-agent`（基于官方 `m5stack/StackChan` @ `eff0d6b`）；实现在 `feature/mcp-agent`
 - 参考实现（已废弃，只读）：`backup/agent-mods-20261027`（含上一轮 mic/speaker WebSocket 流的可用代码与全部踩坑记录）
 - 面向读者：评审人 + 负责实现的 AI Agent
 
----
-
 ## 0. 给实现者的硬性约束（先读这一节）
 
-1. **禁止修改 `firmware/xiaozhi-esp32/` 内任何文件。** 它是 vendored 第三方仓库（78/xiaozhi-esp32 v2.2.4），只允许 include 其头文件、链接其代码（当作库用）。上一轮实现 patch 了它，导致 `fetch_repos.py` 在新克隆上会静默丢补丁，这是本次重写要根治的问题。
+1. **禁止修改 `firmware/xiaozhi-esp32/` 内任何文件，也禁止调用其应用层服务**
+   （`Application`、`McpServer`、协议层、OTA/激活等）。vendored 小智代码只允许
+   当库链接；硬件单例的获取集中在一个文件 `hal/mcp_lan/device_access.*`
+   （全特性唯一允许 include vendored 头文件的地方）。需要的工具逻辑
+   （官方云工具的舵机/LED/提醒等）**抄过来**重绑到自己的注册表，不直接调用。
+   优先使用本仓库现成接口：`hal_bridge`（摄像头/电池/背光）、`Hal`（音量/
+   亮度/Wi-Fi 状态）、`GetStackChan()`（舵机/灯/Avatar）。
 2. **对官方文件的修改仅限 §13 列出的 5 处**，其余一律新增文件。
 3. **每个里程碑以 §14 的验收测试通过为唯一完成标准**，先编译、再烧录、再跑脚本验收，并把结果记录到 `firmware/docs/mcp_agent_progress.md`。
 4. 开工前先执行 §14 的 M-1 基线清理（当前 vendored 子仓是脏的混合状态，必须先还原）。
@@ -450,12 +454,12 @@ ffmpeg -i in.wav -ac 1 -ar 16000 -c:a libopus -application voip -frame_duration 
 
 | # | 事项 | 状态 |
 |---|---|---|
-| 1 | **红外**：机体有红外收发硬件（README 明示），但官方固件零驱动、零引脚定义（grep 无 rmt/NEC/infrared 驱动代码）。要做必须先拿到原理图/引脚号（需用户提供），再写 RMT 收发 + `self.ir.send/receive` 工具。 | 阻塞，列为可选 M6+ |
+| 1 | **红外**：~已拍板砍掉，不做~（硬件在但官方固件零驱动、无引脚定义） | 已决策（不做） |
 | 2 | `/speaker` 端到端未验证（上一轮仅编译通过），M4 预算已留足；若配速/背压策略需调整，以 M4 实测为准回填本文档。 | 实现期风险 |
 | 3 | 内部 RAM 余量：新增 67KB 任务栈为静态推算，M0 起每次验收记录 `get_system_info` 实测值，不足则启用 `SPIRAM_TRY_ALLOCATE_WIFI_LWIP`。 | 监控项 |
-| 4 | vendored xiaozhi 未来升级（>v2.2.4）可能动 `Board`/camera 公开 API——本方案不 patch 它，升级风险被限制在 include 的头文件层面。 | 低 |
-| 5 | App 命名 `MCP.AGENT`（对齐现有风格）vs `MCP Agent`（用户原话）——一个字符串的事，默认前者。 | 待确认 |
-| 6 | 优雅关闭 vs warm-reboot 退出（§10.3）：默认先做优雅关闭，实测有残留再退回 reboot（索引动态计算）。 | 待确认 |
+| 4 | vendored xiaozhi 未来升级（>v2.2.4）可能动 `Board`/camera 公开 API——本方案不 patch 它，升级风险被限制在 `device_access` 单文件的 include 层面。 | 低 |
+| 5 | App 命名：~已定 `MCP.AGENT`~ | 已决策 |
+| 6 | 退出策略：~已定优雅关闭（兜底强删+告警），不做 warm reboot~ | 已决策 |
 
 ---
 
