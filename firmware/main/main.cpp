@@ -9,7 +9,6 @@
 #include <mooncake.h>
 #include <apps/apps.h>
 #include <hal/hal.h>
-#include <hal/serial_console.h>
 #include <hal/mcp_lan/device_access.h>
 
 using namespace mooncake;
@@ -31,9 +30,6 @@ extern "C" void app_main(void)
     // with NO_MEM (ESP_ERROR_CHECK abort -> reboot loop). See
     // hal/mcp_lan/device_access.h.
     mcp_dev::audio_codec_warmup();
-
-    // Head-less launcher control over the USB console (see hal/serial_console.h)
-    hal::start_serial_console();
 #endif
 
     // Setup ui hal

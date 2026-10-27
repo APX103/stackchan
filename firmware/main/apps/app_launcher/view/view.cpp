@@ -333,11 +333,6 @@ void LauncherView::init(std::vector<mooncake::AppProps_t> appPorps)
     // Loop multiple times to create fake infinite scroll
     for (int loop = 0; loop < _loop_copies; loop++) {
         for (const auto& props : appPorps) {
-            // Keep track of each icon's appID (first copy only, parallel to
-            // layout order) for serial-remote navigation
-            if (loop == 0) {
-                _icon_app_ids.push_back(props.appID);
-            }
             // Icon panel
             _icon_panels.push_back(std::make_unique<Container>(_panel->get()));
             _icon_panels.back()->setAlign(LV_ALIGN_CENTER);
@@ -516,47 +511,6 @@ void LauncherView::update()
             break;
         default:
             break;
-    }
-}
-
-void LauncherView::scrollNearby(int direction)
-{
-    if (_state != STATE_NORMAL) {
-        return;
-    }
-    // Same gesture the on-screen left/right indicators make.
-    auto current_scroll_x = _panel->getScrollX();
-    int current_index     = (current_scroll_x + _icon_gap / 2) / _icon_gap;
-    int target_index      = current_index + direction;
-    int target_x          = target_index * _icon_gap;
-    int scroll_distance   = target_x - current_scroll_x;
-    _panel->scrollBy(-scroll_distance, 0, LV_ANIM_ON);
-}
-
-int LauncherView::centeredAppId()
-{
-    if (_state != STATE_NORMAL || _icon_app_ids.empty()) {
-        return -1;
-    }
-    auto scroll_x = _panel->getScrollX();
-    int index     = ((int)scroll_x + _icon_gap / 2) / _icon_gap;
-    if (index < 0) {
-        index = 0;
-    }
-    index %= (int)_icon_app_ids.size();
-    return _icon_app_ids[index];
-}
-
-void LauncherView::clickCenterIcon()
-{
-    if (_state != STATE_NORMAL || _icon_app_ids.empty()) {
-        return;
-    }
-    // Feeds the same dispatch a real icon tap uses (handle_state_normal
-    // picks _clicked_app_id up on the next update).
-    const int id = centeredAppId();
-    if (id >= 0) {
-        _clicked_app_id = id;
     }
 }
 
