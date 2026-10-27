@@ -21,6 +21,7 @@
 #include <string>
 
 #include "../hal.h"
+#include "../hal_servo_debug.h"
 #include "device_access.h"
 #include "lan_service.h"
 #include "mcp_photo.h"
@@ -331,8 +332,9 @@ ToolOutput tool_get_head_angles(const cJSON*)
     auto& motion      = GetStackChan().motion();
     int current_yaw   = motion.yawServo().getCurrentAngle() / 10;
     int current_pitch = motion.pitchServo().getCurrentAngle() / 10;
-    char buf[64];
-    snprintf(buf, sizeof(buf), "{\"yaw\": %d, \"pitch\": %d}", current_yaw, current_pitch);
+    char buf[416];
+    snprintf(buf, sizeof(buf), "{\"yaw\": %d, \"pitch\": %d, \"debug\": \"%s\"}", current_yaw,
+             current_pitch, hal_servo_debug::dump().c_str());
     return ok_text(buf);
 }
 

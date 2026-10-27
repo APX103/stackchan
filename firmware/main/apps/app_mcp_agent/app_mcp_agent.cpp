@@ -110,6 +110,11 @@ void AppMcpAgent::onOpen()
 
 void AppMcpAgent::onRunning()
 {
+    // Reminder heartbeat: in xiaozhi mode the stackchan update task ticks
+    // this; in this app nobody else does, and without it reminders created
+    // via MCP never fire.
+    tools::update_reminders();
+
     {
         LvglLockGuard lock;
 

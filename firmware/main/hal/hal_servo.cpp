@@ -8,6 +8,8 @@
 #include <stackchan/stackchan.h>
 #include <smooth_ui_toolkit.hpp>
 #include <mooncake_log.h>
+#include <fmt/format.h>
+#include <string>
 #include <settings.h>
 
 using namespace smooth_ui_toolkit;
@@ -114,6 +116,19 @@ public:
         Servo::setTorqueEnabled(enabled);
         _scs_bus.EnableTorque(_config.id, enabled ? 1 : 0);
         // mclog::tagInfo(_tag, "id: {} set torque: {}", _id, enabled);
+    }
+
+    // Diagnostics for the MCP Agent: everything needed to see why a servo
+    // does (not) move — including the runtime limit the stall protection
+    // shrinks when it (rightly or wrongly) detects a jam.
+    std::string debug_dump(const char* name)
+    {
+        int raw = _scs_bus.ReadPos(_config.id);
+        return fmt::format("{}: angle={} limit=({},{}] runtimeRaw=({},{}] cfgRaw=({},{}] rawPos={} torque={} stallProt={}",
+                           name, getCurrentAngle(), getAngleLimit().x, getAngleLimit().y,
+                           _runtime_raw_pos_limit.x, _runtime_raw_pos_limit.y, _config.rawPosLimit.x,
+                           _config.rawPosLimit.y, raw, getTorqueEnabled() ? 1 : 0,
+                           _config.enableStallProtection ? 1 : 0);
     }
 
     bool getTorqueEnabled() override
@@ -359,3 +374,29 @@ void Hal::servo_init()
 
     GetStackChan().attachMotion(std::move(motion));
 }
+
+// Diagnostics for the MCP Agent (see hal/hal_servo_debug.h). Defined here
+// where the concrete ScsServo type (and its stall-shrunk runtime limits)
+// is visible.
+#include "hal_servo_debug.h"
+#include <stackchan/stackchan.h>
+#include <fmt/format.h>
+
+namespace hal_servo_debug {
+
+static std::string dump_one(Servo& servo, const char* name)
+{
+    auto* scs = dynamic_cast<ScsServo*>(&servo);
+    if (scs == nullptr) {
+        return fmt::format("{}: <unexpected servo type>", name);
+    }
+    return scs->debug_dump(name);
+}
+
+std::string dump()
+{
+    auto& motion = GetStackChan().motion();
+    return dump_one(motion.yawServo(), "yaw") + " " + dump_one(motion.pitchServo(), "pitch");
+}
+
+}  // namespace hal_servo_debug
