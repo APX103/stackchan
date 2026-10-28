@@ -36,12 +36,6 @@ struct Tool {
 // xiaozhi McpServer singleton — the cloud agent keeps its own).
 class Registry {
 public:
-    static Registry& instance()
-    {
-        static Registry instance;
-        return instance;
-    }
-
     void add(Tool tool);
     const Tool* find(const char* name) const;
 
@@ -62,8 +56,9 @@ private:
     std::vector<Tool> tools_;
 };
 
-// Registers the full LAN tool set into the registry (idempotent).
-// Implemented in mcp_tools.cpp.
-void register_all_tools();
+class LanService;
+
+// Registers the full LAN tool set into the service-owned registry.
+void register_all_tools(LanService& service);
 
 }  // namespace mcp_lan

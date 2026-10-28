@@ -24,13 +24,17 @@
 //              (UI timer at 50 FPS, data rate ~33 Hz), peak frequency readout.
 //   TONES    — speaker scale test: do re mi fa sol (and back down) at 20 %
 //              volume, then auto-return to the menu.
+struct AudioTestFft;
+
 class AppAudioTest : public mooncake::AppAbility {
 public:
     AppAudioTest();
+    ~AppAudioTest() override;
 
     void onCreate() override;
     void onOpen() override;
     void onRunning() override;
+    void onSleeping() override;
     void onClose() override;
 
 private:
@@ -51,8 +55,10 @@ private:
     static void audio_task(void* arg);
     void run_spectrum_mode();
     void run_tones_mode();
+    void reclaim_audio_task();
 
     // ---- shared with the audio task ----
+    std::unique_ptr<AudioTestFft> _fft;  // allocated only in spectrum mode
     std::mutex _spec_mtx;
     float _bands[kBandCount] = {0};   // 0..1 per band
     float _peak_hz           = 0;
@@ -62,6 +68,7 @@ private:
     std::atomic<bool> _task_running{false};
     std::atomic<bool> _task_exited{true};
     TaskHandle_t _audio_task_handle = nullptr;
+    std::atomic<bool> _closing{false};
     std::atomic<int> _tone_note{-1};         // index into the scale, -1 = none
     std::atomic<bool> _tones_done{false};
     std::atomic<int> _mic_level{0};          // 0..100, small meter on spectrum view

@@ -456,3 +456,44 @@ IDF 默认的单次收发等待有限，但客户端只要不断在单次超时�
 3. 验证 Home 返回、重复进入退出、资源基线和既有 AI.AGENT 无回归。
 4. 更新 `firmware/docs/mcp_agent_progress.md`，记录测试版本、命令、结果和仍存在的限制。
 5. 若某项因硬件状态无法验证，明确写出缺什么设备操作或故障注入条件，不把风险关闭为“应该没问题”。
+
+---
+
+## 12. 2026-10-28 修复与验证状态（后续追加）
+
+本节不改变前述静态审查的历史结论。状态分为“代码已修且有对应证据”“仍阻塞”“未验证”；不把代码修改本身等同于完整验收。
+
+### 12.1 已有对应修复和证据
+
+- **P0-1**：`AsyncToolJob` 共享拥有参数、ID、结果和 async request；HTTP 超时不再释放 worker 仍使用的参数，响应只完成一次。可控长工具/重复超时故障注入仍未完成。
+- **P1-1**：工具请求使用 `httpd_req_async_handler_begin()`；Home 使用 request/stopped/reclaim，HTTPD 停止等待不在 Mooncake。单次关闭重进及扩展 smoke 通过，10 轮导航另行记录。
+- **P1-2**：MCP 和 AUDIO.TEST 正常退出不再强删任务；WithCaps 句柄在退出后由 owner 回收。底层驱动永久等待不能靠此机制取消。
+- **P1-4**：离线网络启动不再调用原 65 秒阻塞流程，HTTPD 只在连接已建立后创建。物理离线导航仍待人工验收。
+- **P1-5**：speech timer 由 App 持有并在关闭时取消；使用 `lv_timer_get_user_data()`，不再依赖旧全局 timer。
+- **P1-6**：提醒为 App-local 单 UI 上下文 store；host 测试覆盖超过 5 个、一次性、重复、停止和清空。
+- **P1-7**：JPEG 使用不可变 shared snapshot；URL 和 embed smoke 通过，关闭时清理保留照片。相机 frame 本身的风险不因 JPEG 快照消失。
+- **P2-1**：Breath/Blink/HeadPet 按 ID 移除，HeadPet 遥测连接断开。
+- **P2-2**：socket-close 释放两路音频 claim，mic 带 session 防 FD 复用；同时修复了 `close_fn` 未实际 `close(fd)` 导致的 accept(23)。
+- **P2-3**：任务创建失败、HTTPD/endpoint 启动失败进入统一停止路径；启动故障注入仍未完成。
+- **P2-4**：`set_volume` 纳入 codec 控制锁，smoke 25/75 通过。
+- **P2-5 / P2-6**：Bearer 比较长度安全，WS query 按 `&` 边界解析。启用 token 的专项测试未执行。
+- **P2-8**：等待队列有界，满载返回 503，不再静默 pop/drop。
+- **UI 附加问题**：`onOpen()` IP hint 刷新纳入 LVGL 锁后，原先的 `set_emotion` UI 超时和看门狗路径消失，扩展 smoke 全通过。UI action 异常/超时取消由 host 测试覆盖。
+
+### 12.2 仍然阻塞或未关闭
+
+- **P1-3 相机不可取消**：未改 HAL，join/DQBUF/底层永久等待无法保证取消，不能计入已修。
+- **P1-8 LVGL 锁失败**：共享 guard 未改变，仍不能表达未取得锁；未做锁失败下的安全保证。
+- **P2-7 完整 WS frame deadline**：HTTP body 已有 10 秒总 deadline，WS 慢帧总 deadline 未实现。
+- **条件性风险**：跨 camera 消费者 frame 所有权、任务/server 句柄的全部并发时序、OOM 和锁失败注入仍需专项验证。
+- **音频内部 RAM（新运行时证据）**：Codec 构造后 free internal 约 25 KB、largest 16 KB，22 KB mic 栈无法创建；mic-first 的 DMA 断言已改为可返回错误。20 ms/16 KB 候选栈溢出已撤回。mic/speaker/全双工不能记为已验证。
+
+### 12.3 AI 与其他 App 回归
+
+- fresh、MCP 后、AUDIO.TEST 后三条 AI 数据链路均取得检测任务和有效 PCM；详见 `ai_agent_vad_static_review.md` 第 11 节。
+- MCP→AI 的重复 `StartNetwork()` 无 `Connected` 事件问题已通过 App 内 Station 交接修复。正常 Home 不断网。
+- 唤醒词、触摸 Listening、实际放音、舵机安全和其他 App 肉眼导航仍需现场人员，不在“已通过”范围内。
+
+### 12.4 后续验收原则
+
+继续保留长任务、慢客户端、并发/背压、故障注入和资源计数门槛。任何“smoke 全绿”都只代表对应顺序工具调用，不替代上述未决项。10 轮导航和最终生产烧录的实测结果写入 `mcp_agent_progress.md`。

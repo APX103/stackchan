@@ -72,9 +72,6 @@ public:
 	int ReadMove(int ID);//读移动状态
 	int ReadCurrent(int ID);//读电流
 	int ReadToqueEnable(int ID);//读扭矩使能状态
-	// Raw register access for diagnostics / EPROM healing (motor-mode repair)
-	int readRegister(u8 ID, u8 addr) { return readWord(ID, addr); }
-	int writeRegister(u8 ID, u8 addr, u16 value) { return writeWord(ID, addr, value); }
 private:
 	u8 Mem[SCSCL_PRESENT_CURRENT_H-SCSCL_PRESENT_POSITION_L+1];
 	int min_angle[256] = {0};

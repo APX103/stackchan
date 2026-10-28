@@ -84,6 +84,3 @@ CONFIG_LV_BUILD_DEMOS=n
 
 # WebSocket support in esp_http_server (needed by the MCP Agent audio streams)
 CONFIG_HTTPD_WS_SUPPORT=y
-
-# 60 FPS-capable refresh (AUDIO.TEST spectrum animation targets 50 FPS)
-CONFIG_LV_DEF_REFR_PERIOD=16

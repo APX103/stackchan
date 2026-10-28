@@ -22,7 +22,7 @@
 #include <assets/assets.h>
 #include <apps/common/common.h>
 
-#include "hal/mcp_lan/device_access.h"
+#include "audio_test_audio.h"
 
 using namespace mooncake;
 using namespace smooth_ui_toolkit::lvgl_cpp;
@@ -68,16 +68,14 @@ static lv_obj_t* make_card(lv_obj_t* parent, int32_t x, int32_t w, lv_event_cb_t
     return card;
 }
 
-// 512-point iterative radix-2 FFT with a precomputed twiddle table.
-namespace {
-
+// 512-point iterative radix-2 FFT with a lazily owned twiddle table.
 constexpr int kFftN = 512;
 
-struct Fft {
+struct AudioTestFft {
     float wr[kFftN / 2];
     float wi[kFftN / 2];
 
-    Fft()
+    AudioTestFft()
     {
         for (int k = 0; k < kFftN / 2; k++) {
             const float ang = -2.0f * (float)M_PI * k / kFftN;
@@ -120,9 +118,8 @@ struct Fft {
     }
 };
 
-const Fft kFft;
-
 // Log-spaced band edges (~80 Hz .. ~12 kHz across 32 bands).
+namespace {
 float band_edge(int i)
 {
     const float lo    = 80.0f;
@@ -133,6 +130,21 @@ float band_edge(int i)
 }  // namespace
 
 // ---------------------------------------------------------------- app
+
+AppAudioTest::~AppAudioTest()
+{
+    if (_root == nullptr && _audio_task_handle == nullptr) {
+        return;
+    }
+    _closing = true;
+    _task_mode.store((int)TaskMode::Idle);
+    _task_running.store(false);
+    while (_audio_task_handle != nullptr && !_task_exited.load()) {
+        GetHAL().feedTheDog();
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    onClose();
+}
 
 AppAudioTest::AppAudioTest()
 {
@@ -149,6 +161,12 @@ void AppAudioTest::onCreate()
 
 void AppAudioTest::onOpen()
 {
+    if (_closing) {
+        if (_audio_task_handle != nullptr && !_task_exited.load()) {
+            return;
+        }
+        onClose();
+    }
     mclog::tagInfo(getAppInfo().name, "on open");
     s_active_instance = this;
 
@@ -165,7 +183,11 @@ void AppAudioTest::onOpen()
 
         build_menu_view();
 
-        view::create_home_indicator([&]() { close(); }, _theme_color, _theme_color_dark);
+        view::create_home_indicator([this]() {
+            _closing = true;
+            _task_mode.store((int)TaskMode::Idle);
+            _task_running.store(false);
+        }, _theme_color, _theme_color_dark);
     }
 
     _task_running.store(true);
@@ -374,6 +396,13 @@ void AppAudioTest::on_ui_tick()
 
 void AppAudioTest::onRunning()
 {
+    if (_closing) {
+        if (_task_exited.load()) {
+            reclaim_audio_task();
+            close();
+        }
+        return;
+    }
     LvglLockGuard lock;
 
     view::update_home_indicator();
@@ -384,19 +413,36 @@ void AppAudioTest::onRunning()
     }
 }
 
+void AppAudioTest::onSleeping()
+{
+    if (_closing && _task_exited.load()) {
+        onClose();
+    }
+}
+
+void AppAudioTest::reclaim_audio_task()
+{
+    if (_audio_task_handle != nullptr && _task_exited.load()) {
+        vTaskDeleteWithCaps(_audio_task_handle);
+        _audio_task_handle = nullptr;
+    }
+}
+
 void AppAudioTest::onClose()
 {
+    _closing = true;
+    _task_mode.store((int)TaskMode::Idle);
+    _task_running.store(false);
+    if (_audio_task_handle != nullptr && !_task_exited.load()) {
+        return;
+    }
+    reclaim_audio_task();
+
     mclog::tagInfo(getAppInfo().name, "on close");
 
     _task_mode.store((int)TaskMode::Idle);
     _task_running.store(false);
-    for (int i = 0; i < 15 && !_task_exited.load(); i++) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-    if (_audio_task_handle != nullptr) {
-        vTaskDeleteWithCaps(_audio_task_handle);
-        _audio_task_handle = nullptr;
-    }
+    _fft.reset();
 
     {
         LvglLockGuard lock;
@@ -408,6 +454,10 @@ void AppAudioTest::onClose()
         _root.reset();
         view::destroy_home_indicator();
     }
+    if (s_active_instance == this) {
+        s_active_instance = nullptr;
+    }
+    _closing = false;
 }
 
 // ---------------------------------------------------------------- audio
@@ -420,7 +470,7 @@ static constexpr int kGapMs  = 80;
 
 void AppAudioTest::run_tones_mode()
 {
-    auto* codec = mcp_dev::audio_codec();
+    auto* codec = audio_test::codec();
     if (codec == nullptr) {
         _tones_done.store(true);
         return;
@@ -431,7 +481,7 @@ void AppAudioTest::run_tones_mode()
     GetHAL().setSpeakerVolume(20);  // user-requested test volume
 
     {
-        std::lock_guard<std::mutex> lock(mcp_dev::codec_mutex());
+        std::lock_guard<std::mutex> lock(audio_test::codec_mutex());
         codec->EnableOutput(true);
         codec->Start();
     }
@@ -467,7 +517,7 @@ void AppAudioTest::run_tones_mode()
 
     _tone_note.store(-1);
     {
-        std::lock_guard<std::mutex> lock(mcp_dev::codec_mutex());
+        std::lock_guard<std::mutex> lock(audio_test::codec_mutex());
         codec->EnableOutput(false);
     }
     GetHAL().setSpeakerVolume(_saved_volume);
@@ -477,13 +527,16 @@ void AppAudioTest::run_tones_mode()
 
 void AppAudioTest::run_spectrum_mode()
 {
-    auto* codec = mcp_dev::audio_codec();
+    auto* codec = audio_test::codec();
     if (codec == nullptr) {
         return;
     }
+    if (!_fft) {
+        _fft = std::make_unique<AudioTestFft>();
+    }
 
     {
-        std::lock_guard<std::mutex> lock(mcp_dev::codec_mutex());
+        std::lock_guard<std::mutex> lock(audio_test::codec_mutex());
         codec->EnableInput(true);
         // The duplex I2S bus is clocked from the output side — opening the output
         // only starts the clocks, nothing is played (and nothing feeds back).
@@ -540,7 +593,7 @@ void AppAudioTest::run_spectrum_mode()
                 im[i] = 0;
             }
             mic.erase(mic.begin(), mic.begin() + kFftN);
-            kFft.run(re, im);
+            _fft->run(re, im);
 
             // 32 log-spaced bands. mag/(N/4) is the equivalent sine amplitude
             // (int16 scale), so dB = 20*log10(amplitude) spans roughly
@@ -589,7 +642,7 @@ void AppAudioTest::run_spectrum_mode()
     }
 
     {
-        std::lock_guard<std::mutex> lock(mcp_dev::codec_mutex());
+        std::lock_guard<std::mutex> lock(audio_test::codec_mutex());
         codec->EnableInput(false);
         codec->EnableOutput(false);
     }

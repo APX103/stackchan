@@ -344,3 +344,28 @@ MCP mic 路径对样本使用额外数字增益，而 AI AudioService 输入路�
 - IDF 5.5.4/5.5.5 和全局 LVGL 配置是否与现象有关？目前没有 A/B 证据。
 
 **记录截止：当前仅完成静态审阅，没有确认根因，没有提出或实施修复。**
+
+---
+
+## 11. 2026-10-28 后续运行时复核（与上述静态记录分开）
+
+以下结果来自后续临时测试固件。生产源码已恢复；`PcmDiag` 和自动导航只用于测试，没有留在正式固件。
+
+### 11.1 已通过的数据链路
+
+1. **fresh boot → AI**：`Audio detection task started`，42 个 PCM 窗口，mic 峰值 14,156，无看门狗或复位证据。日志：`ai_fresh_current.log`（临时诊断目录）。
+2. **MCP 关闭 → AI**：初次复现了第二次 `StartNetwork()` 只报告 `Station already active`、Application 停在 Starting 的问题。原因是已连接 Station 不会再次发 `Connected`。在“曾打开 MCP 且明确进入 AI”的析构交接中，通过公共 `StopStation()` 让 AI 重新建立 Station 后，检测任务启动，取得 33 个 PCM 窗口，mic 峰值 22,420。正常 Home 不断网，fresh 直接 AI 不执行该重置。日志：`ai_after_mcp_wifi_handoff.log`。
+3. **fresh boot → AUDIO.TEST 频谱 → 关闭 → AI**：通过真实 LVGL card 事件进入 SPECTRUM；关闭前先出现 input/output `false`，再到 `on close`，没有强删任务。缩短测试导航时序后，AI 检测任务启动，取得 73 个 PCM 窗口，mic 峰值 16,930。日志：`audio_regression_full.log`。
+
+这些结果证明上述三条路径的 AI 输入、重采样和 WakeNet/AFE 检测任务能够工作。AUDIO.TEST 后 AI 启动时仍有两条 `i2s_channel_disable: the channel has not been enabled yet` 错误日志，但后续 PCM 持续有效；未为消除日志去改公共 HAL。
+
+### 11.2 仍未验证或仍阻塞
+
+- **真实唤醒词、触摸进入 Listening、Listening VAD transition、实际 mic 音质和 speaker 放音**：需要现场人员，不以 PCM 峰值替代。
+- **MCP 活动 mic 流成功后再进 AI**：尚未验证。22 KB mic 栈与 Codec DMA 的连续内部 RAM 预算冲突；mic-first 曾触发 DMA 分配失败复位，后已改为先构造 Codec、后申请任务栈，使失败变成明确错误且服务不复位。该保护通过不代表活动 mic 路径通过。
+- 20 ms/16 KB mic 候选发生 core dump 确认的栈溢出，已撤回；恢复 60 ms/22 KB。不得把缩帧写成内存问题已解决。
+- fresh/MCP/AUDIO.TEST 的短时数据链路通过，不等于所有长时间运行、云端连接、唤醒和触摸场景都已回归。
+
+### 11.3 当前结论边界
+
+原静态报告中“安装不等于运行”仍成立；全局 warmup 和静态 FFT 常驻已移除。后续问题还涉及 App 退出时的 Codec/任务清理和重复网络启动，而不是单纯 VAD 参数错误。生产 `firmware/main/hal` 与线上 `main` 一致，没有用私有 HAL 修改掩盖这些路径。

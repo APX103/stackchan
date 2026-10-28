@@ -7,6 +7,7 @@
 
 #include <sdkconfig.h>
 #include <esp_system.h>
+#include <misc/lv_timer.h>
 
 #include <hal/hal.h>
 #include <mooncake_log.h>
@@ -15,8 +16,8 @@
 #include <stackchan/avatar/skins/default/default.h>
 #include <apps/common/common.h>
 
-#include "hal/mcp_lan/device_access.h"
-#include "hal/mcp_lan/lan_service.h"
+#include "platform/device_access.h"
+#include "service/lan_service.h"
 
 using namespace mooncake;
 using namespace smooth_ui_toolkit::lvgl_cpp;
@@ -25,6 +26,26 @@ using namespace stackchan;
 // Blue theme of the MCP Agent app (launcher icon / status bar).
 static constexpr uint32_t _theme_color      = 0x3366CC;
 static constexpr uint32_t _theme_color_dark = 0x101F3C;
+
+AppMcpAgent::~AppMcpAgent()
+{
+    if (_service != nullptr) {
+        // uninstallAllApps() destroys abilities directly, without onClose().
+        // The final desktop-to-AI transition must not leave callbacks or
+        // tasks using this App. Home never takes this synchronous path.
+        _closing = true;
+        _service->request_stop();
+        while (!_service->stopped()) {
+            GetHAL().feedTheDog();
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        _service->reclaim();
+        onClose();
+    }
+    if (_opened_once && GetHAL().isXiaozhiStartRequested()) {
+        mcp_dev::wifi_stop_for_ai_handoff();
+    }
+}
 
 AppMcpAgent::AppMcpAgent()
 {
@@ -48,7 +69,15 @@ void AppMcpAgent::onCreate()
 // Full diagnostics live on GET / and the serial log.
 void AppMcpAgent::onOpen()
 {
+    if (_closing) {
+        if (!_service->stopped()) {
+            return;  // previous close is still stopping; do not reinitialize
+        }
+        onClose();
+    }
+
     mclog::tagInfo(getAppInfo().name, "on open");
+    _opened_once = true;
 
     {
         LvglLockGuard lock;
@@ -60,21 +89,28 @@ void AppMcpAgent::onOpen()
         auto avatar = std::make_unique<avatar::DefaultAvatar>();
         avatar->init(lv_screen_active());
         GetStackChan().attachAvatar(std::move(avatar));
-        GetStackChan().addModifier(std::make_unique<BreathModifier>());
-        GetStackChan().addModifier(std::make_unique<BlinkModifier>());
+        _breath_modifier_id = GetStackChan().addModifier(std::make_unique<BreathModifier>());
+        _blink_modifier_id = GetStackChan().addModifier(std::make_unique<BlinkModifier>());
         // Head-pet interaction (same as the AI Agent app): stroking the
         // head makes the face blush with hearts and a happy wiggle, then
         // returns to normal after a few seconds.
-        GetStackChan().addModifier(std::make_unique<HeadPetModifier>());
+        _headpet_modifier_id = GetStackChan().addModifier(std::make_unique<HeadPetModifier>());
         // Gesture observability: every head-pet gesture shows up in the
         // service event line (GET / last_event) — separates "touch not
         // detected" from "modifier not reacting".
-        _pet_conn = GetHAL().onHeadPetGesture.connect([](HeadPetGesture g) {
-            mcp_lan::service_push_event("headpet gesture %d", (int)g);
+        _pet_conn = GetHAL().onHeadPetGesture.connect([this](HeadPetGesture g) {
+            if (_service != nullptr) {
+                _service->push_event("headpet gesture %d", (int)g);
+            }
         });
 
         // Common widgets (status bar + home indicator at the bottom to exit)
-        view::create_home_indicator([&]() { close(); }, _theme_color, _theme_color_dark);
+        view::create_home_indicator([this]() {
+            _closing = true;
+            if (_service != nullptr) {
+                _service->request_stop();
+            }
+        }, _theme_color, _theme_color_dark);
         view::create_status_bar(_theme_color, _theme_color_dark);
 
         // The only hint: a small dim "ip:port" at the bottom edge so a LAN
@@ -86,44 +122,76 @@ void AppMcpAgent::onOpen()
         _label_ip_hint->setText("");
     }
 
-    // Bring Wi-Fi up if needed (same flow as the App Center), then serve.
+    _service = std::make_unique<mcp_lan::LanService>();
+    _service->set_ui_hooks({
+        .execute = [this](const mcp_lan::LanService::UiAction& action, uint32_t timeout_ms) {
+            return ui_execute(action, timeout_ms);
+        },
+        .show_message = [this](const std::string& text, uint32_t duration_ms) {
+            show_message(text, duration_ms);
+        },
+        .clear_message = [this] { clear_message(); },
+        .create_reminder = [this](uint32_t duration_ms, const std::string& message, bool repeat) {
+            return create_reminder(duration_ms, message, repeat);
+        },
+        .get_reminders = [this] { return get_reminders(); },
+        .stop_reminder = [this](int id) { stop_reminder(id); },
+    });
     if (!mcp_dev::wifi_connected()) {
-        std::unique_ptr<view::LoadingPage> loading_page;
         {
             LvglLockGuard lock;
-            loading_page = std::make_unique<view::LoadingPage>(_theme_color, _theme_color_dark);
+            // Offline startup remains interactive: the launcher/Setup app can
+            // provision Wi-Fi later; HTTPD starts only after LwIP is ready.
+            _service_start_pending = true;
+            _label_ip_hint->setText("offline - configure WiFi in SETUP");
         }
-        GetHAL().startNetwork([&](std::string_view msg) {
-            LvglLockGuard lock;
-            loading_page->setMessage(msg);
-        });
-        {
-            LvglLockGuard lock;
-            loading_page.reset();
-        }
+        mcp_dev::wifi_start();
+        return;
     }
 
     std::string err;
-    if (!mcp_lan::service_start(&err)) {
+    if (!_service->start(&err)) {
         mclog::tagError(getAppInfo().name, "service start failed: {}", err);
         LvglLockGuard lock;
         _label_ip_hint->setText("start failed");
         return;
     }
     _last_refresh_ms = 0;
-    refresh_ip_hint();
+    {
+        LvglLockGuard lock;
+        refresh_ip_hint();
+    }
 }
 
 void AppMcpAgent::onRunning()
 {
-    // Reminder heartbeat: in xiaozhi mode the stackchan update task ticks
-    // this; in this app nobody else does, and without it reminders created
-    // via MCP never fire.
-    tools::update_reminders();
+    if (_closing) {
+        if (_service->stopped()) {
+            _service->reclaim();
+            close();
+        }
+        return;
+    }
+
+    if (_service_start_pending && mcp_dev::wifi_connected()) {
+        _service_start_pending = false;
+        std::string err;
+        if (!_service->start(&err)) {
+            mclog::tagError(getAppInfo().name, "deferred service start failed: {}", err);
+            LvglLockGuard lock;
+            _label_ip_hint->setText("start failed");
+            return;
+        }
+        _last_refresh_ms = 0;
+    }
 
     {
         LvglLockGuard lock;
 
+        process_ui_jobs();
+        _reminders.tick(GetHAL().millis(), [this](const mcp_lan::ReminderInfo& reminder) {
+            show_message(reminder.message, 5000);
+        });
         GetStackChan().update();
 
         view::update_home_indicator();
@@ -133,17 +201,50 @@ void AppMcpAgent::onRunning()
     }
 }
 
-// Exiting this app is what stops the server: all endpoints, tasks and audio
-// claims are released, then control returns to the launcher.
+void AppMcpAgent::onSleeping()
+{
+    // A direct closeApp() advances Mooncake to Sleeping after onClose().
+    // Finish deferred cleanup here instead of leaving the old UI connected
+    // until the next open.
+    if (_closing && _service != nullptr && _service->stopped()) {
+        _service->reclaim();
+        onClose();
+    }
+}
+
+// onClose() runs only after the service's asynchronous stop has completed.
+// It performs bounded UI cleanup; no HTTPD or worker waits are allowed here.
 void AppMcpAgent::onClose()
 {
-    mclog::tagInfo(getAppInfo().name, "on close");
+    if (!_closing) {
+        _closing = true;
+        _service->request_stop();
+        if (!_service->stopped()) {
+            return;  // Mooncake close must not destroy live UI/service state
+        }
+        _service->reclaim();
+    }
 
-    mcp_lan::service_stop();
+    mclog::tagInfo(getAppInfo().name, "on close");
 
     {
         LvglLockGuard lock;
 
+        if (_breath_modifier_id >= 0) {
+            GetStackChan().removeModifier(_breath_modifier_id);
+            _breath_modifier_id = -1;
+        }
+        if (_blink_modifier_id >= 0) {
+            GetStackChan().removeModifier(_blink_modifier_id);
+            _blink_modifier_id = -1;
+        }
+        if (_headpet_modifier_id >= 0) {
+            GetStackChan().removeModifier(_headpet_modifier_id);
+            _headpet_modifier_id = -1;
+        }
+        clear_message();
+        _reminders.clear();
+        cancel_ui_jobs();
         GetStackChan().resetAvatar();
 
         if (_pet_conn != 0) {
@@ -155,6 +256,8 @@ void AppMcpAgent::onClose()
         view::destroy_home_indicator();
         view::destroy_status_bar();
     }
+    _service.reset();
+    _closing = false;
 }
 
 void AppMcpAgent::refresh_ip_hint()
@@ -165,7 +268,11 @@ void AppMcpAgent::refresh_ip_hint()
     }
     _last_refresh_ms = now;
 
-    auto st = mcp_lan::service_status();
+    auto st = _service->status();
+    if (_service_start_pending) {
+        _label_ip_hint->setText("offline - configure WiFi in SETUP");
+        return;
+    }
     // Be honest on screen: an IP without a listener is worse than no hint.
     if (!st.running) {
         _label_ip_hint->setText("service failed");
@@ -194,4 +301,110 @@ void AppMcpAgent::refresh_ip_hint()
     char hint[28];
     snprintf(hint, sizeof(hint), "%s:%d", ip.c_str(), st.port);
     _label_ip_hint->setText(hint);
+}
+
+bool AppMcpAgent::ui_execute(const std::function<void()>& action, uint32_t timeout_ms)
+{
+    if (!action || _closing) {
+        return false;
+    }
+    auto pending = std::make_shared<UiPending>();
+    {
+        std::lock_guard<std::mutex> lock(_ui_jobs_mtx);
+        if (_closing) {
+            return false;
+        }
+        _ui_jobs.emplace_back(action, pending);
+    }
+
+    return pending->wait(timeout_ms);
+}
+
+void AppMcpAgent::process_ui_jobs()
+{
+    for (int count = 0; count < 4; ++count) {
+        UiJob job;
+        {
+            std::lock_guard<std::mutex> lock(_ui_jobs_mtx);
+            if (_ui_jobs.empty()) {
+                return;
+            }
+            job = std::move(_ui_jobs.front());
+            _ui_jobs.pop_front();
+        }
+
+        const auto result = job.second->run(job.first);
+        if (result == mcp_lan::UiJobResult::Failed) {
+            mclog::tagError(getAppInfo().name, "UI action raised an exception");
+        }
+    }
+}
+
+void AppMcpAgent::cancel_ui_jobs()
+{
+    std::deque<UiJob> jobs;
+    {
+        std::lock_guard<std::mutex> lock(_ui_jobs_mtx);
+        jobs.swap(_ui_jobs);
+    }
+    for (auto& job : jobs) {
+        job.second->cancel();
+    }
+}
+
+void AppMcpAgent::show_message(const std::string& text, uint32_t duration_ms)
+{
+    if (!GetStackChan().hasAvatar()) {
+        return;
+    }
+    GetStackChan().avatar().setSpeech(text);
+    if (_speech_timer != nullptr) {
+        lv_timer_delete(_speech_timer);
+        _speech_timer = nullptr;
+    }
+    if (duration_ms > 0) {
+        _speech_timer = lv_timer_create(speech_timer_cb, duration_ms, this);
+        if (_speech_timer != nullptr) {
+            lv_timer_set_repeat_count(_speech_timer, 1);
+        }
+    }
+}
+
+void AppMcpAgent::clear_message()
+{
+    if (GetStackChan().hasAvatar()) {
+        GetStackChan().avatar().setSpeech("");
+    }
+    if (_speech_timer != nullptr) {
+        lv_timer_delete(_speech_timer);
+        _speech_timer = nullptr;
+    }
+}
+
+void AppMcpAgent::speech_timer_cb(lv_timer_t* timer)
+{
+    auto* app = static_cast<AppMcpAgent*>(lv_timer_get_user_data(timer));
+    if (app == nullptr) {
+        return;
+    }
+    if (GetStackChan().hasAvatar()) {
+        GetStackChan().avatar().setSpeech("");
+    }
+    app->_speech_timer = nullptr;
+    lv_timer_delete(timer);
+}
+
+int AppMcpAgent::create_reminder(uint32_t duration_ms, const std::string& message, bool repeat)
+{
+    return _reminders.create(GetHAL().millis(), duration_ms, message, repeat);
+}
+
+std::vector<mcp_lan::ReminderInfo> AppMcpAgent::get_reminders()
+{
+    return _reminders.active();
+}
+
+void AppMcpAgent::stop_reminder(int id)
+{
+    _reminders.stop(id);
 }

@@ -46,6 +46,17 @@ config MCP_AGENT_ENABLE_OWNER_TOOLS
 
 endmenu
 
+menu "Audio Test"
+
+config AUDIO_TEST_ENABLE
+    bool "Enable the standalone AUDIO.TEST app"
+    default y
+    help
+        Installs AUDIO.TEST independently of MCP Agent. Its audio task and
+        FFT resources are created only while the app is in use.
+
+endmenu
+
 menu "Xiaozhi Assistant"
 
 config OTA_URL

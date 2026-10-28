@@ -6,7 +6,7 @@ Requires: pip install websocket-client
 Record 10 s from the robot's microphone:
     python ws_audio_test.py mic <device-ip> [out.opus] [--token TOKEN]
 
-Play an Opus file to the robot's speaker (16 kHz mono 60 ms self-delimited
+Play an Opus file to the robot's speaker (16 kHz mono 60 ms self-contained
 frames, as produced by `ffmpeg -i in.wav -ac 1 -ar 16000 -c:a libopus
 -application voip -frame_duration 60 -f data out.opus`):
     python ws_audio_test.py speaker <device-ip> play.opus [--token TOKEN]

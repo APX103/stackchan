@@ -9,8 +9,6 @@
 #include <mooncake.h>
 #include <apps/apps.h>
 #include <hal/hal.h>
-#include <hal/mcp_lan/device_access.h>
-#include <hal/mcp_lan/servo_heal.h>
 
 using namespace mooncake;
 using namespace smooth_ui_toolkit;
@@ -21,23 +19,8 @@ extern "C" void app_main(void)
     mclog::set_level(mclog::level_info);
     mclog::set_time_format(mclog::time_format_unix_milliseconds);
 
-#if CONFIG_MCP_AGENT_ENABLE
-    // Pre-HAL servo healing (see hal/mcp_lan/servo_heal.h): must run before
-    // Hal::init() opens the servo bus. Keeps the official HAL untouched.
-    mcp_lan::heal_servos_before_hal_init();
-#endif
-
     // HAL init
     GetHAL().init();
-
-#if CONFIG_MCP_AGENT_ENABLE
-    // Construct the audio codec singleton at boot: it is lazily created on
-    // first use, and when that first use happens late (e.g. the MCP Agent
-    // app opening after Wi-Fi is up) the I2S channel allocation can fail
-    // with NO_MEM (ESP_ERROR_CHECK abort -> reboot loop). See
-    // hal/mcp_lan/device_access.h.
-    mcp_dev::audio_codec_warmup();
-#endif
 
     // Setup ui hal
     ui_hal::on_delay([](uint32_t ms) { GetHAL().delay(ms); });
@@ -52,6 +35,8 @@ extern "C" void app_main(void)
         GetMooncake().installApp(std::make_unique<AppAiAgent>());
 #if CONFIG_MCP_AGENT_ENABLE
         GetMooncake().installApp(std::make_unique<AppMcpAgent>());
+#endif
+#if CONFIG_AUDIO_TEST_ENABLE
         GetMooncake().installApp(std::make_unique<AppAudioTest>());
 #endif
         GetMooncake().installApp(std::make_unique<AppAvatar>());

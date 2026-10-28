@@ -10,6 +10,7 @@
 #include <freertos/task.h>
 
 #include <atomic>
+#include <cstdint>
 
 // Real-time microphone stream over WebSocket for the MCP Agent app.
 //
@@ -29,6 +30,10 @@
 //            mono before encoding.
 // Limits   : one client at a time; a second client receives
 //            {"type":"error","message":"busy"}.
+namespace mcp_lan {
+class LanService;
+}
+
 class MicWsStream {
 public:
     static MicWsStream& GetInstance()
@@ -39,15 +44,31 @@ public:
 
     // Registers the /mic WebSocket handler on `server` and spawns the
     // capture task (idle until a client claims the stream).
-    bool Start(httpd_handle_t server);
+    bool Start(httpd_handle_t server, mcp_lan::LanService& service);
 
     // Unregisters the handler, disconnects the client and stops capturing.
     void Stop();
+
+    // A stopped service is not reusable until its capture task has released
+    // the codec and its WithCaps stack has been reclaimed.
+    static bool Stopped()
+    {
+        auto& self = GetInstance();
+        return self.server_ == nullptr &&
+               (self.capture_task_ == nullptr || self.task_exited_.load());
+    }
+    static void Reclaim();
 
     // True while a client holds the stream.
     static bool IsActive()
     {
         return GetInstance().client_fd_.load() >= 0;
+    }
+
+    // Returns true only while the exact client generation is still active.
+    static bool IsSessionActive(int fd, uint64_t session)
+    {
+        return GetInstance().client_fd_.load() == fd && GetInstance().session_.load() == session;
     }
 
     // Remaining free stack of the capture task in bytes (-1 when not running)
@@ -57,7 +78,11 @@ public:
     // Releases the streaming claim of `fd` (if it is the active client).
     // Called when an async send fails — the only reliable way to notice a
     // client that vanished without a stop frame.
-    static void ReleaseClient(int fd);
+    static void ReleaseClient(int fd, uint64_t session);
+
+    // HTTPD close_fn entry: covers a peer that disappears without sending
+    // another WebSocket frame.
+    static void HandleDisconnect(httpd_handle_t server, int fd);
 
 private:
     MicWsStream() = default;
@@ -72,10 +97,12 @@ private:
     bool EnsureCaptureTask();
 
     httpd_handle_t server_ = nullptr;
+    mcp_lan::LanService* mcp_service_ = nullptr;
     TaskHandle_t capture_task_ = nullptr;
     std::atomic<bool> running_{false};
     std::atomic<bool> task_exited_{false};
     // Socket of the active streaming client; -1 while idle. Claimed via
     // compare_exchange so exactly one client wins.
     std::atomic<int> client_fd_{-1};
+    std::atomic<uint64_t> session_{0};
 };

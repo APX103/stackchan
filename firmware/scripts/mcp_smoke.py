@@ -99,6 +99,11 @@ def main():
     r = call_tool("self.screen.get_info")
     check("screen_info", '"width":320' in r["result"]["content"][0]["text"])
 
+    check("set_volume 25", not call_tool("self.audio_speaker.set_volume", {"volume": 25})["result"].get("isError"))
+    check("set_volume 75", not call_tool("self.audio_speaker.set_volume", {"volume": 75})["result"].get("isError"))
+    check("set_brightness 20", not call_tool("self.screen.set_brightness", {"brightness": 20})["result"].get("isError"))
+    check("set_brightness 75", not call_tool("self.screen.set_brightness", {"brightness": 75})["result"].get("isError"))
+
     # -- display group --
     check("set_emotion happy", not call_tool("self.display.set_emotion", {"emotion": "happy"})["result"].get("isError"))
     check("show_message", not call_tool("self.display.show_message", {"text": "MCP smoke test", "duration_ms": 3000})["result"].get("isError"))
@@ -126,6 +131,11 @@ def main():
     with urllib.request.urlopen(photo_url, timeout=10) as resp:
         data = resp.read()
     check("GET /photo.jpg", resp_ok(data) and data[:2] == b"\xff\xd8", f"{len(data)} bytes")
+
+    # -- inline image response --
+    r = call_tool("self.camera.take_photo", {"quality": 20, "embed": True})
+    check("take_photo embed", any(part.get("type") == "image" and len(part.get("data", "")) > 100
+                                 for part in r["result"]["content"]))
 
     # -- audio stream discovery --
     r = call_tool("self.microphone.stream")

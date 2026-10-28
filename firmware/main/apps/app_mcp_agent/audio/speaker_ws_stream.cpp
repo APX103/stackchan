@@ -17,17 +17,18 @@
 
 #include <chrono>
 
-#include "mic_ws_stream.h"
-#include "mcp_lan/device_access.h"
-#include "mcp_lan/lan_service.h"
+#include "codec_bus.h"
+#include "../platform/device_access.h"
+#include "../service/lan_service.h"
 #include "esp_opus_dec.h"
-#include "ws_util.h"
+#include "../protocol/ws_util.h"
 
 static const char* TAG = "SpkWs";
 
 // Backlog limit while the playback task is busy: ~0.5 s of 60 ms packets.
 // Beyond that the sender is outrunning the speaker and frames are dropped.
 constexpr size_t kMaxQueuedPackets = 8;
+constexpr int kFrameMs = 60;
 
 void SpeakerWsStream::PlaybackTask(void* arg) {
     auto& self = *static_cast<SpeakerWsStream*>(arg);
@@ -42,9 +43,9 @@ void SpeakerWsStream::PlaybackTask(void* arg) {
     // The duplex I2S bus is clocked from the output side and the mic capture
     // task already opened it; these calls are idempotent covers for the case
     // where it has not. Control calls are serialized against the mic task.
+    mcp_audio::acquire_output(codec);
     {
         std::lock_guard<std::mutex> lock(mcp_dev::codec_mutex());
-        codec->EnableOutput(true);
         codec->Start();
     }
 
@@ -52,7 +53,7 @@ void SpeakerWsStream::PlaybackTask(void* arg) {
     // unused the ~30 KB it needs stay available to the rest of the system.
     void* decoder = nullptr;
     // Opus frame of 60 ms at the codec output rate (24 kHz -> 1440 samples).
-    const size_t frame_samples = codec->output_sample_rate() / 1000 * 60;
+    const size_t frame_samples = codec->output_sample_rate() / 1000 * kFrameMs;
     std::vector<int16_t> pcm(frame_samples);
     uint32_t played = 0;
     int decode_errs = 0;
@@ -125,40 +126,53 @@ void SpeakerWsStream::PlaybackTask(void* arg) {
     if (decoder != nullptr) {
         esp_opus_dec_close(decoder);
     }
-    // Only release the output device when the mic is not streaming: the
-    // duplex I2S bus is clocked from the output side and the mic capture
-    // would read back zeroes without it.
-    if (!MicWsStream::IsActive()) {
-        std::lock_guard<std::mutex> lock(mcp_dev::codec_mutex());
-        codec->EnableOutput(false);
-    }
+    mcp_audio::release_output(codec);
     ESP_LOGI(TAG, "playback task stopped (%u packets played)", (unsigned)played);
     self.task_exited_ = true;
     // WithCaps tasks must NOT self-delete: park here, the owner deletes us.
     vTaskDelay(portMAX_DELAY);
 }
 
+void SpeakerWsStream::HandleDisconnect(httpd_handle_t server, int fd) {
+    auto& self = GetInstance();
+    if (self.server_ != server) {
+        return;
+    }
+    int current = self.client_fd_.load();
+    if (current == fd && self.client_fd_.compare_exchange_strong(current, -1)) {
+        self.running_ = false;
+        {
+            std::lock_guard<std::mutex> lock(self.queue_mutex_);
+            self.packet_queue_.clear();
+        }
+        self.queue_cv_.notify_all();
+        if (self.mcp_service_ != nullptr) {
+            self.mcp_service_->push_event("speaker: client disconnected");
+        }
+    }
+}
+
 esp_err_t SpeakerWsStream::WsHandler(httpd_req_t* req) {
     auto& self = GetInstance();
 
     // NOTE: no method check here — same reasoning as MicWsStream.
-    if (!mcp_lan::service_ws_authorized(req)) {
+    if (self.mcp_service_ == nullptr || !self.mcp_service_->ws_authorized(req)) {
         wsutil::SendError(req, "unauthorized");
         return ESP_FAIL;  // close the session
     }
 
     httpd_ws_frame_t pkt;
     std::vector<uint8_t> payload;
+    const int fd = httpd_req_to_sockfd(req);
     esp_err_t ret = wsutil::RecvFrame(req, &pkt, &payload);
     if (ret == ESP_ERR_INVALID_SIZE) {
         wsutil::SendError(req, "frame too large");
         return ESP_FAIL;
     }
     if (ret != ESP_OK) {
-        return ret;  // transport-level failure, httpd closes the session
+        HandleDisconnect(self.server_, fd);
+        return ret;
     }
-
-    int fd = httpd_req_to_sockfd(req);
 
     // Control frames (e.g. an unexpected PONG) are consumed silently.
     if (pkt.type != HTTPD_WS_TYPE_TEXT && pkt.type != HTTPD_WS_TYPE_BINARY) {
@@ -193,11 +207,15 @@ esp_err_t SpeakerWsStream::WsHandler(httpd_req_t* req) {
             // Playback task is created on demand — its stack is only worth
             // holding while a client actually streams.
             if (!self.EnsurePlaybackTask()) {
+                const bool restarting = self.playback_task_ != nullptr && !self.task_exited_.load();
                 self.client_fd_ = -1;
-                return wsutil::SendError(req, "no memory for playback task");
+                return wsutil::SendError(req, restarting ? "playback task is restarting" :
+                                                          "no memory for playback task");
             }
             ESP_LOGI(TAG, "client fd %d started playback", fd);
-            mcp_lan::service_push_event("speaker: client started");
+            if (self.mcp_service_ != nullptr) {
+                self.mcp_service_->push_event("speaker: client started");
+            }
             {
                 // Fresh session: nothing from a previous client may still be
                 // waiting in the queue.
@@ -209,6 +227,8 @@ esp_err_t SpeakerWsStream::WsHandler(httpd_req_t* req) {
                 "\"frame_ms\":60,\"codec\":\"opus\"}";
             if (wsutil::SendText(req, kHello) != ESP_OK) {
                 self.client_fd_ = -1;
+                self.running_ = false;
+                self.queue_cv_.notify_all();
             }
             return ESP_OK;
         }
@@ -221,9 +241,16 @@ esp_err_t SpeakerWsStream::WsHandler(httpd_req_t* req) {
     if (strstr(msg, "\"stop\"") != nullptr) {
         int current = self.client_fd_.load();
         if (current == fd) {
-            // Only the claim is released; packets already queued play out.
             self.client_fd_.compare_exchange_strong(current, -1);
-            mcp_lan::service_push_event("speaker: client stopped");
+            self.running_ = false;
+            {
+                std::lock_guard<std::mutex> lock(self.queue_mutex_);
+                self.packet_queue_.clear();
+            }
+            self.queue_cv_.notify_all();
+            if (self.mcp_service_ != nullptr) {
+                self.mcp_service_->push_event("speaker: client stopped");
+            }
         }
         return ESP_OK;
     }
@@ -231,16 +258,17 @@ esp_err_t SpeakerWsStream::WsHandler(httpd_req_t* req) {
     return wsutil::SendError(req, "unsupported message (expected start/stop)");
 }
 
-bool SpeakerWsStream::Start(httpd_handle_t server) {
+bool SpeakerWsStream::Start(httpd_handle_t server, mcp_lan::LanService& service) {
     if (server == nullptr) {
         return false;
     }
+    mcp_service_ = &service;
     if (server_ != nullptr) {
         return true;  // already running
     }
     server_ = server;
     // The playback task is created lazily on the first client "start" (see
-    // WsHandler): its 24 KB stack must not sit in the heap while nobody
+    // WsHandler): its 16 KB stack must not sit in the heap while nobody
     // streams — internal RAM is the scarcest resource on this board.
     httpd_uri_t ws_speaker              = {};
     ws_speaker.uri                      = "/speaker";
@@ -265,23 +293,37 @@ int SpeakerWsStream::StackHighWaterBytes() {
     return (int)(uxTaskGetStackHighWaterMark(self.playback_task_) * sizeof(StackType_t));
 }
 
+void SpeakerWsStream::Reclaim() {
+    auto& self = GetInstance();
+    if (self.playback_task_ != nullptr && self.task_exited_.load()) {
+        vTaskDeleteWithCaps(self.playback_task_);
+        self.playback_task_ = nullptr;
+    }
+    self.mcp_service_ = nullptr;
+}
+
 bool SpeakerWsStream::EnsurePlaybackTask() {
+    if (mcp_dev::audio_codec() == nullptr) {
+        return false;
+    }
     // Clean up a previously parked task first.
-    if (playback_task_ != nullptr && task_exited_.load()) {
+    if (playback_task_ != nullptr) {
+        if (!task_exited_.load()) {
+            return false;  // previous playback is still stopping cooperatively
+        }
         vTaskDeleteWithCaps(playback_task_);
         playback_task_ = nullptr;
-    }
-    if (playback_task_ != nullptr) {
-        return true;
     }
     running_     = true;
     task_exited_ = false;
     // 16 KB internal stack (decode is lighter than encode; telemetry on
-    // GET /);
+    // GET /).
     // BYTES with WithCaps; must not be PSRAM (flash-write cache assert).
     if (xTaskCreatePinnedToCoreWithCaps(PlaybackTask, "spk_ws", 2048 * 8, this, 4, &playback_task_, 1,
                                         MALLOC_CAP_INTERNAL) != pdPASS) {
-        ESP_LOGE(TAG, "failed to create playback task (out of internal RAM?)");
+        ESP_LOGE(TAG, "failed to create playback task: free internal=%u, largest=%u",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         playback_task_ = nullptr;
         running_       = false;
         return false;
@@ -297,18 +339,8 @@ void SpeakerWsStream::Stop() {
     httpd_unregister_uri(server_, "/speaker");
     running_ = false;
     queue_cv_.notify_all();
-    if (playback_task_ != nullptr) {
-        // The queue wait wakes on running_=false within a second, so the
-        // task normally parks itself quickly; then we free it.
-        for (int i = 0; i < 15 && !task_exited_.load(); i++) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
-        if (!task_exited_.load()) {
-            ESP_LOGW(TAG, "playback task did not exit in time, force-deleting (decoder leaked)");
-        }
-        vTaskDeleteWithCaps(playback_task_);
-        playback_task_ = nullptr;
-    }
+    // The playback task owns decoder and codec cleanup. It is reclaimed by
+    // EnsurePlaybackTask only after task_exited_ becomes true.
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
         packet_queue_.clear();

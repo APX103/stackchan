@@ -28,16 +28,19 @@ AudioCodec* audio_codec()
     return Board::GetInstance().GetAudioCodec();
 }
 
-void audio_codec_warmup()
-{
-    const auto* codec = audio_codec();
-    ESP_LOGI("McpDev", "audio codec warmup: %s (free heap %u)",
-             codec != nullptr ? "ok" : "missing", (unsigned)esp_get_free_heap_size());
-}
-
 StackChanCamera* camera()
 {
     return hal_bridge::board_get_camera();
+}
+
+void wifi_start()
+{
+    Board::GetInstance().StartNetwork();
+}
+
+void wifi_stop_for_ai_handoff()
+{
+    WifiManager::GetInstance().StopStation();
 }
 
 bool wifi_connected()

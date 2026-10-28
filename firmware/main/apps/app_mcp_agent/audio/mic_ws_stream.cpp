@@ -20,11 +20,12 @@
 #include <cstdlib>
 #include <algorithm>
 
-#include "mcp_lan/device_access.h"
-#include "mcp_lan/lan_service.h"
+#include "../platform/device_access.h"
+#include "../service/lan_service.h"
+#include "codec_bus.h"
 #include "esp_opus_enc.h"
 #include "esp_ae_rate_cvt.h"
-#include "ws_util.h"
+#include "../protocol/ws_util.h"
 
 static const char* TAG = "MicWs";
 
@@ -41,11 +42,16 @@ namespace {
 struct WsSendJob {
     httpd_handle_t server;
     int fd;
+    uint64_t session;
     std::shared_ptr<std::vector<uint8_t>> packet;
 };
 
 void ws_send_job(void* arg) {
     auto* job = static_cast<WsSendJob*>(arg);
+    if (!MicWsStream::IsSessionActive(job->fd, job->session)) {
+        delete job;
+        return;
+    }
     httpd_ws_frame_t frame = {};
     frame.type             = HTTPD_WS_TYPE_BINARY;
     frame.payload          = job->packet->data();
@@ -53,34 +59,46 @@ void ws_send_job(void* arg) {
     if (httpd_ws_send_frame_async(job->server, job->fd, &frame) != ESP_OK) {
         // Session is gone (client disconnected): free the stream so the
         // capture task stops feeding a dead socket.
-        MicWsStream::ReleaseClient(job->fd);
-        mcp_lan::service_push_event("mic: client dropped");
+        MicWsStream::ReleaseClient(job->fd, job->session);
     }
     delete job;
 }
 }  // namespace
 
 int MicWsStream::StackHighWaterBytes() {
-    auto& self = GetInstance();
+    auto& self = MicWsStream::GetInstance();
     if (self.capture_task_ == nullptr) {
         return -1;
     }
     return (int)(uxTaskGetStackHighWaterMark(self.capture_task_) * sizeof(StackType_t));
 }
 
-void MicWsStream::ReleaseClient(int fd) {
-    auto& self = GetInstance();
+void MicWsStream::ReleaseClient(int fd, uint64_t session) {
+    auto& self = MicWsStream::GetInstance();
     int current = self.client_fd_.load();
-    if (current == fd) {
+    if (current == fd && self.session_.load() == session) {
         self.client_fd_.compare_exchange_strong(current, -1);
+        self.session_++;
+        self.running_ = false;
+        if (self.mcp_service_ != nullptr) {
+            self.mcp_service_->push_event("mic: client dropped");
+        }
         // The capture task notices the lost claim and parks itself after an
-        // idle grace period (its 24 KB stack returns to the heap then).
+        // idle grace period (its 22 KB stack returns to the heap then).
         ESP_LOGI(TAG, "client fd %d released", fd);
     }
 }
 
-esp_err_t MicWsStream::WsHandler(httpd_req_t* req) {
+void MicWsStream::HandleDisconnect(httpd_handle_t server, int fd) {
     auto& self = GetInstance();
+    if (self.server_ != server) {
+        return;
+    }
+    ReleaseClient(fd, self.session_.load());
+}
+
+esp_err_t MicWsStream::WsHandler(httpd_req_t* req) {
+    auto& self = MicWsStream::GetInstance();
 
     // NOTE: no method check here. This handler is invoked once per incoming
     // WebSocket frame (the HTTP GET handshake never reaches it), and in that
@@ -88,13 +106,14 @@ esp_err_t MicWsStream::WsHandler(httpd_req_t* req) {
     // would write a plain HTTP response into the stream and corrupt the
     // protocol.
 
-    if (!mcp_lan::service_ws_authorized(req)) {
+    if (self.mcp_service_ == nullptr || !self.mcp_service_->ws_authorized(req)) {
         wsutil::SendError(req, "unauthorized");
         return ESP_FAIL;  // close the session
     }
 
     httpd_ws_frame_t pkt;
     std::vector<uint8_t> payload;
+    const int fd = httpd_req_to_sockfd(req);
     esp_err_t ret = wsutil::RecvFrame(req, &pkt, &payload);
     if (ret == ESP_ERR_INVALID_SIZE) {
         // Larger than the drain limit: the payload cannot be skipped, so
@@ -103,10 +122,9 @@ esp_err_t MicWsStream::WsHandler(httpd_req_t* req) {
         return ESP_FAIL;
     }
     if (ret != ESP_OK) {
-        return ret;  // transport-level failure, httpd closes the session
+        ReleaseClient(fd, self.session_.load());
+        return ret;
     }
-
-    int fd = httpd_req_to_sockfd(req);
 
     // Control frames (e.g. an unexpected PONG) are consumed silently.
     if (pkt.type != HTTPD_WS_TYPE_TEXT && pkt.type != HTTPD_WS_TYPE_BINARY) {
@@ -125,19 +143,25 @@ esp_err_t MicWsStream::WsHandler(httpd_req_t* req) {
     if (strstr(msg, "\"start\"") != nullptr) {
         int expected = -1;
         if (self.client_fd_.compare_exchange_strong(expected, fd)) {
+            self.session_++;
             // Create the capture task on demand — its stack is only worth
             // holding while a client actually streams.
             if (!self.EnsureCaptureTask()) {
+                const bool restarting = self.capture_task_ != nullptr && !self.task_exited_.load();
                 self.client_fd_ = -1;
-                return wsutil::SendError(req, "no memory for capture task");
+                self.session_++;
+                return wsutil::SendError(req, restarting ? "capture task is restarting" :
+                                                          "no memory for capture task");
             }
             ESP_LOGI(TAG, "client fd %d started streaming", fd);
-            mcp_lan::service_push_event("mic: client started");
+            if (self.mcp_service_ != nullptr) {
+                self.mcp_service_->push_event("mic: client started");
+            }
             static const char* kHello =
                 "{\"type\":\"hello\",\"sample_rate\":16000,\"channels\":1,"
                 "\"frame_ms\":60,\"codec\":\"opus\"}";
             if (wsutil::SendText(req, kHello) != ESP_OK) {
-                self.client_fd_ = -1;
+                ReleaseClient(fd, self.session_.load());
             }
             return ESP_OK;
         }
@@ -153,7 +177,11 @@ esp_err_t MicWsStream::WsHandler(httpd_req_t* req) {
         int current = self.client_fd_.load();
         if (current == fd) {
             self.client_fd_.compare_exchange_strong(current, -1);
-            mcp_lan::service_push_event("mic: client stopped");
+            self.session_++;
+            self.running_ = false;
+            if (self.mcp_service_ != nullptr) {
+                self.mcp_service_->push_event("mic: client stopped");
+            }
         }
         return ESP_OK;
     }
@@ -167,26 +195,25 @@ void MicWsStream::CaptureTask(void* arg) {
     auto* codec = mcp_dev::audio_codec();
     if (codec == nullptr) {
         ESP_LOGE(TAG, "board has no audio codec, mic stream disabled");
+        self.client_fd_ = -1;
+        self.session_++;
         self.task_exited_ = true;
         vTaskDelay(portMAX_DELAY);  // WithCaps tasks must not self-delete
         return;
     }
+    mcp_audio::acquire_output(codec);
     {
         // The speaker task initializes its codec side at the same time;
         // control calls must not interleave (see device_access.h).
         std::lock_guard<std::mutex> lock(mcp_dev::codec_mutex());
         codec->EnableInput(true);
-        // The duplex I2S bus is clocked from the output side — without the
-        // output device open the ES7210 never gets a BCLK and reads back all
-        // zeroes. Nothing is played here, this only starts the clocks.
-        codec->EnableOutput(true);
         codec->Start();
     }
 
     // The I2S stream is interleaved stereo: slot 0 = microphone, slot 1 =
     // playback reference (measured: [mic, -2, mic, -2...]). Effective mic
-    // rate is the configured 24 kHz (720 mic samples arrive every 30 ms
-    // inside 1440 interleaved samples).
+    // rate is the configured 24 kHz (1440 mic samples arrive every 60 ms
+    // inside 2880 interleaved samples).
     const uint32_t in_rate_config = codec->input_sample_rate();
     const bool need_resample      = in_rate_config != kOpusSampleRate;
     esp_ae_rate_cvt_handle_t resampler = nullptr;
@@ -198,9 +225,16 @@ void MicWsStream::CaptureTask(void* arg) {
         rs_cfg.bits_per_sample        = ESP_AUDIO_BIT16;
         rs_cfg.complexity             = 2;
         rs_cfg.perf_type              = ESP_AE_RATE_CVT_PERF_TYPE_SPEED;
-        if (esp_ae_rate_cvt_open(&rs_cfg, &resampler) != ESP_AUDIO_ERR_OK) {
-            ESP_LOGE(TAG, "failed to open resampler %lu->%d", in_rate_config, kOpusSampleRate);
-            self.task_exited_ = true;
+        if (esp_ae_rate_cvt_open(&rs_cfg, &resampler) != ESP_AE_ERR_OK) {
+        ESP_LOGE(TAG, "failed to open resampler %lu->%d", in_rate_config, kOpusSampleRate);
+        self.client_fd_ = -1;
+        self.session_++;
+        {
+            std::lock_guard<std::mutex> lock(mcp_dev::codec_mutex());
+            codec->EnableInput(false);
+        }
+        mcp_audio::release_output(codec);
+        self.task_exited_ = true;
             vTaskDelay(portMAX_DELAY);  // WithCaps tasks must not self-delete
             return;
         }
@@ -222,9 +256,16 @@ void MicWsStream::CaptureTask(void* arg) {
     void* encoder = nullptr;
     if (esp_opus_enc_open(&enc_cfg, sizeof(enc_cfg), &encoder) != ESP_AUDIO_ERR_OK || encoder == nullptr) {
         ESP_LOGE(TAG, "failed to open opus encoder");
+        self.client_fd_ = -1;
+        self.session_++;
         if (resampler != nullptr) {
             esp_ae_rate_cvt_close(resampler);
         }
+        {
+            std::lock_guard<std::mutex> lock(mcp_dev::codec_mutex());
+            codec->EnableInput(false);
+        }
+        mcp_audio::release_output(codec);
         self.task_exited_ = true;
         vTaskDelay(portMAX_DELAY);  // WithCaps tasks must not self-delete
         return;
@@ -234,9 +275,8 @@ void MicWsStream::CaptureTask(void* arg) {
     esp_opus_enc_get_frame_size(encoder, &frame_bytes, &out_bytes);
     const size_t frame_samples = frame_bytes / sizeof(int16_t);  // 960 @ 60 ms
 
-    // 60 ms capture chunk at the codec rate, resampled output, and a small
-    // accumulator so resampler jitter never breaks frame alignment.
-    const size_t in_chunk     = in_rate_config / 1000 * kFrameMs;  // 1440 interleaved samples per read
+    // One 60 ms chunk at the codec rate, including both interleaved slots.
+    const size_t in_chunk     = in_rate_config / 1000 * kFrameMs * 2;
     std::vector<int16_t> in_buf(in_chunk);
     std::vector<int16_t> mic_buf(in_chunk / 2);  // de-interleaved mic channel
     std::vector<int16_t> rs_buf(in_chunk);
@@ -311,7 +351,7 @@ void MicWsStream::CaptureTask(void* arg) {
             stat_produced += produced;
             pcm.insert(pcm.end(), rs_buf.begin(), rs_buf.begin() + produced);
         } else {
-            pcm.insert(pcm.end(), in_buf.begin(), in_buf.end());
+            pcm.insert(pcm.end(), mic_buf.begin(), mic_buf.end());
         }
 
         if (stat_tick >= 10000) {
@@ -339,7 +379,7 @@ void MicWsStream::CaptureTask(void* arg) {
                 // Copy the packet: the queued send outlives this iteration.
                 auto packet = std::make_shared<std::vector<uint8_t>>(enc_buf.begin(),
                                                                      enc_buf.begin() + out.encoded_bytes);
-                auto* job   = new WsSendJob{self.server_, fd, packet};
+                auto* job   = new WsSendJob{self.server_, fd, self.session_.load(), packet};
                 if (httpd_queue_work(self.server_, ws_send_job, job) != ESP_OK) {
                     // Work queue full: client is too slow, drop the frame.
                     delete job;
@@ -347,7 +387,7 @@ void MicWsStream::CaptureTask(void* arg) {
                         // Persistently stalled: release the stream instead of
                         // spinning forever against a stuck client.
                         ESP_LOGW(TAG, "httpd queue kept full, releasing client");
-                        self.ReleaseClient(fd);
+                        self.ReleaseClient(fd, self.session_.load());
                     }
                 } else {
                     queue_full_count = 0;
@@ -365,6 +405,7 @@ void MicWsStream::CaptureTask(void* arg) {
         std::lock_guard<std::mutex> lock(mcp_dev::codec_mutex());
         codec->EnableInput(false);
     }
+    mcp_audio::release_output(codec);
     ESP_LOGI(TAG, "capture task stopped");
     self.task_exited_ = true;
     // WithCaps tasks must NOT self-delete: park here, the owner deletes us
@@ -372,16 +413,17 @@ void MicWsStream::CaptureTask(void* arg) {
     vTaskDelay(portMAX_DELAY);
 }
 
-bool MicWsStream::Start(httpd_handle_t server) {
+bool MicWsStream::Start(httpd_handle_t server, mcp_lan::LanService& service) {
     if (server == nullptr) {
         return false;
     }
+    mcp_service_ = &service;
     if (server_ != nullptr) {
         return true;  // already running
     }
     server_ = server;
     // The capture task is created lazily on the first client "start" (see
-    // WsHandler): its 24 KB stack must not sit in the heap while nobody
+    // WsHandler): its 22 KB stack must not sit in the heap while nobody
     // streams — internal RAM is the scarcest resource on this board.
     httpd_uri_t ws_mic              = {};
     ws_mic.uri                      = "/mic";
@@ -398,28 +440,44 @@ bool MicWsStream::Start(httpd_handle_t server) {
     return true;
 }
 
+void MicWsStream::Reclaim() {
+    auto& self = GetInstance();
+    if (self.capture_task_ != nullptr && self.task_exited_.load()) {
+        vTaskDeleteWithCaps(self.capture_task_);
+        self.capture_task_ = nullptr;
+    }
+    self.mcp_service_ = nullptr;
+}
+
 bool MicWsStream::EnsureCaptureTask() {
+    // Construct the public codec before reserving the large task stack. Its
+    // DMA allocation uses ESP_ERROR_CHECK; doing it afterwards can reset the
+    // device instead of returning a stream-start error on a busy heap.
+    if (mcp_dev::audio_codec() == nullptr) {
+        return false;
+    }
     // Clean up a previously parked task first (its stack is still held
     // until deleted with WithCaps semantics).
-    if (capture_task_ != nullptr && task_exited_.load()) {
+    if (capture_task_ != nullptr) {
+        if (!task_exited_.load()) {
+            return false;  // previous capture is still stopping cooperatively
+        }
         vTaskDeleteWithCaps(capture_task_);
         capture_task_ = nullptr;
     }
-    if (capture_task_ != nullptr) {
-        return true;
-    }
     running_     = true;
     task_exited_ = false;
-    // 22 KB internal stack — 16 K smashed the heap on the first Opus frame
-    // (24 K was proven good; 22 K keeps margin with less footprint).
-    // mic_stack_free on GET / reports the true high-water.
+    // 22 KB internal stack — 16 KB overflowed in both the original 60 ms
+    // configuration and the tested 20 ms configuration (core dump confirmed).
     // WithCaps takes the depth in BYTES; the stack
     // must stay in INTERNAL RAM: flash writes (NVS etc.) briefly disable
     // the cache, and a task executing on a PSRAM stack hits
     // "assert failed: esp_task_stack_is_sane_cache_disabled" and reboots.
     if (xTaskCreatePinnedToCoreWithCaps(CaptureTask, "mic_ws", 2048 * 11, this, 4, &capture_task_, 1,
                                         MALLOC_CAP_INTERNAL) != pdPASS) {
-        ESP_LOGE(TAG, "failed to create capture task (out of internal RAM?)");
+        ESP_LOGE(TAG, "failed to create capture task: free internal=%u, largest=%u",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         capture_task_ = nullptr;
         running_      = false;
         return false;
@@ -431,21 +489,12 @@ void MicWsStream::Stop() {
     if (server_ == nullptr) {
         return;
     }
+    session_++;
     client_fd_ = -1;
     httpd_unregister_uri(server_, "/mic");
     running_ = false;
-    if (capture_task_ != nullptr) {
-        // The task parks itself (vTaskDelay(portMAX_DELAY)) after setting
-        // task_exited_; once parked it is safe for this task to free it.
-        for (int i = 0; i < 15 && !task_exited_.load(); i++) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
-        if (!task_exited_.load()) {
-            ESP_LOGW(TAG, "capture task did not exit in time, force-deleting (encoder leaked)");
-        }
-        vTaskDeleteWithCaps(capture_task_);
-        capture_task_ = nullptr;
-    }
+    // The capture task owns its encoder and codec cleanup. It is reclaimed
+    // by EnsureCaptureTask only after task_exited_ becomes true.
     server_ = nullptr;
     ESP_LOGI(TAG, "microphone stream stopped");
 }

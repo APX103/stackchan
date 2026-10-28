@@ -15,6 +15,12 @@ file(GLOB_RECURSE STACK_CHAN_SOURCES
     "stackchan/*.cc"
     "stackchan/*.cpp"
 )
+if(NOT CONFIG_MCP_AGENT_ENABLE)
+    list(FILTER STACK_CHAN_SOURCES EXCLUDE REGEX "/apps/app_mcp_agent/")
+endif()
+if(NOT CONFIG_AUDIO_TEST_ENABLE)
+    list(FILTER STACK_CHAN_SOURCES EXCLUDE REGEX "/apps/app_audio_test/")
+endif()
 set(STACK_CHAN_INCLUDE_DIRS 
     "."
 )

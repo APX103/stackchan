@@ -18,15 +18,14 @@
 
 #include <cJSON.h>
 
+#include <memory>
 #include <string>
 
-#include "../hal.h"
-#include "../hal_servo_debug.h"
-#include "device_access.h"
-#include "lan_service.h"
+#include <hal/hal.h>
+#include "../platform/device_access.h"
+#include "../service/lan_service.h"
 #include "mcp_photo.h"
-#include "mcp_registry.h"
-#include <apps/common/common.h>
+#include "../protocol/mcp_registry.h"
 #include <stackchan/avatar/avatar.h>
 #include <stackchan/stackchan.h>
 
@@ -156,6 +155,14 @@ ToolOutput ok_json(cJSON* node)
     return out;
 }
 
+ToolOutput ui_error()
+{
+    ToolOutput out;
+    out.is_error = true;
+    out.text = "UI unavailable";
+    return out;
+}
+
 // ---------------- device tools ----------------
 
 ToolOutput tool_get_device_status(const cJSON*)
@@ -205,7 +212,10 @@ ToolOutput tool_set_volume(const cJSON* args)
     if (!get_int(args, "volume", &volume, &err, true, 0, 0, 100)) {
         return err;
     }
-    GetHAL().setSpeakerVolume((uint8_t)volume);
+    {
+        std::lock_guard<std::mutex> lock(mcp_dev::codec_mutex());
+        GetHAL().setSpeakerVolume((uint8_t)volume);
+    }
     return ok_text("ok");
 }
 
@@ -245,7 +255,7 @@ bool map_emotion(const std::string& name, avatar::Emotion* out)
     return true;
 }
 
-ToolOutput tool_set_emotion(const cJSON* args)
+ToolOutput tool_set_emotion(LanService& service, const cJSON* args)
 {
     ToolOutput err;
     std::string emotion;
@@ -259,28 +269,23 @@ ToolOutput tool_set_emotion(const cJSON* args)
                    " (supported: neutral, happy, laughing, angry, sad, crying, sleepy, doubtful)";
         return err;
     }
-    {
-        LvglLockGuard lock;
+
+    auto out = std::make_shared<ToolOutput>();
+    const bool executed = service.ui_execute([out, mapped] {
         if (!GetStackChan().hasAvatar()) {
-            err.is_error = true;
-            err.text     = "no avatar attached (MCP Agent app not running)";
-            return err;
+            out->is_error = true;
+            out->text = "no avatar attached (MCP Agent app not running)";
+            return;
         }
         GetStackChan().avatar().setEmotion(mapped);
+    });
+    if (!executed) {
+        return ui_error();
     }
-    return ok_text("ok");
+    return *out;
 }
 
-lv_timer_t* g_speech_timer = nullptr;
-
-void speech_clear_timer_cb(lv_timer_t* timer)
-{
-    GetStackChan().avatar().setSpeech("");
-    lv_timer_delete(timer);
-    g_speech_timer = nullptr;
-}
-
-ToolOutput tool_show_message(const cJSON* args)
+ToolOutput tool_show_message(LanService& service, const cJSON* args)
 {
     ToolOutput err;
     std::string text;
@@ -291,54 +296,34 @@ ToolOutput tool_show_message(const cJSON* args)
     if (!get_int(args, "duration_ms", &duration_ms, &err, false, 10000, 0, 600000)) {
         return err;
     }
-    {
-        LvglLockGuard lock;
-        if (!GetStackChan().hasAvatar()) {
-            err.is_error = true;
-            err.text     = "no avatar attached (MCP Agent app not running)";
-            return err;
-        }
-        GetStackChan().avatar().setSpeech(text);
-        if (g_speech_timer != nullptr) {
-            lv_timer_delete(g_speech_timer);
-            g_speech_timer = nullptr;
-        }
-        if (duration_ms > 0) {
-            g_speech_timer = lv_timer_create(speech_clear_timer_cb, (uint32_t)duration_ms, nullptr);
-            lv_timer_set_repeat_count(g_speech_timer, 1);
-        }
+    if (!service.show_message(text, (uint32_t)duration_ms)) {
+        return ui_error();
     }
     return ok_text("ok");
 }
 
-ToolOutput tool_clear_message(const cJSON*)
+ToolOutput tool_clear_message(LanService& service, const cJSON*)
 {
-    LvglLockGuard lock;
-    if (GetStackChan().hasAvatar()) {
-        GetStackChan().avatar().setSpeech("");
-    }
-    if (g_speech_timer != nullptr) {
-        lv_timer_delete(g_speech_timer);
-        g_speech_timer = nullptr;
-    }
-    return ok_text("ok");
+    return service.clear_message() ? ok_text("ok") : ui_error();
 }
 
 // ---------------- robot tools (ported from hal_mcp.cpp, same semantics) ----
 
-ToolOutput tool_get_head_angles(const cJSON*)
+ToolOutput tool_get_head_angles(LanService& service, const cJSON*)
 {
-    LvglLockGuard lock;  // StackChan motion update runs under the LVGL lock
-    auto& motion      = GetStackChan().motion();
-    int current_yaw   = motion.yawServo().getCurrentAngle() / 10;
-    int current_pitch = motion.pitchServo().getCurrentAngle() / 10;
-    char buf[416];
-    snprintf(buf, sizeof(buf), "{\"yaw\": %d, \"pitch\": %d, \"debug\": \"%s\"}", current_yaw,
-             current_pitch, hal_servo_debug::dump().c_str());
-    return ok_text(buf);
+    auto out = std::make_shared<ToolOutput>();
+    const bool executed = service.ui_execute([out] {
+        auto& motion = GetStackChan().motion();
+        const int current_yaw = motion.yawServo().getCurrentAngle() / 10;
+        const int current_pitch = motion.pitchServo().getCurrentAngle() / 10;
+        char buf[64];
+        snprintf(buf, sizeof(buf), "{\"yaw\": %d, \"pitch\": %d}", current_yaw, current_pitch);
+        *out = ok_text(buf);
+    });
+    return executed ? *out : ui_error();
 }
 
-ToolOutput tool_set_head_angles(const cJSON* args)
+ToolOutput tool_set_head_angles(LanService& service, const cJSON* args)
 {
     ToolOutput err;
     int yaw = 0, pitch = 0, speed = 0;
@@ -347,39 +332,49 @@ ToolOutput tool_set_head_angles(const cJSON* args)
     if (!get_int(args, "pitch", &pitch, &err, false, -9999, -9999, 90)) return err;
     if (!get_int(args, "speed", &speed, &err, false, 150, 100, 1000)) return err;
 
-    LvglLockGuard lock;
-    auto& motion = GetStackChan().motion();
-    // NOTE: no explicit torque enable — SCS servos energize on the goal
-    // write itself (the official cloud tools and idle motion rely on it).
-    if (pitch != -9999) {
-        motion.pitchServo().moveWithSpeed(pitch * 10, speed);
-    }
-    if (yaw != -9999) {
-        motion.yawServo().moveWithSpeed(yaw * 10, speed);
-    }
-    return ok_text("ok");
+    auto out = std::make_shared<ToolOutput>();
+    const bool executed = service.ui_execute([out, yaw, pitch, speed] {
+        auto& motion = GetStackChan().motion();
+        // Position writes are ignored while torque is released. Enable it
+        // for the move; the servo stack auto-releases after rest.
+        motion.setTorqueEnabled(true);
+        if (pitch != -9999) {
+            motion.pitchServo().moveWithSpeed(pitch * 10, speed);
+        }
+        if (yaw != -9999) {
+            motion.yawServo().moveWithSpeed(yaw * 10, speed);
+        }
+        *out = ok_text("ok");
+    });
+    return executed ? *out : ui_error();
 }
 
-ToolOutput tool_look_at(const cJSON* args)
+ToolOutput tool_look_at(LanService& service, const cJSON* args)
 {
     ToolOutput err;
     double x = 0, y = 0;
     if (!get_double(args, "x", &x, &err, true, 0, -1.0, 1.0)) return err;
     if (!get_double(args, "y", &y, &err, true, 0, -1.0, 1.0)) return err;
 
-    LvglLockGuard lock;
-    GetStackChan().motion().lookAtNormalized((float)x, (float)y);
-    return ok_text("ok");
+    const bool executed = service.ui_execute([x, y] {
+        auto& motion = GetStackChan().motion();
+        motion.setTorqueEnabled(true);
+        motion.lookAtNormalized((float)x, (float)y);
+    });
+    return executed ? ok_text("ok") : ui_error();
 }
 
-ToolOutput tool_go_home(const cJSON*)
+ToolOutput tool_go_home(LanService& service, const cJSON*)
 {
-    LvglLockGuard lock;
-    GetStackChan().motion().goHome(500);
-    return ok_text("ok");
+    const bool executed = service.ui_execute([] {
+        auto& motion = GetStackChan().motion();
+        motion.setTorqueEnabled(true);
+        motion.goHome(500);
+    });
+    return executed ? ok_text("ok") : ui_error();
 }
 
-ToolOutput tool_set_led_color(const cJSON* args)
+ToolOutput tool_set_led_color(LanService& service, const cJSON* args)
 {
     ToolOutput err;
     int r = 0, g = 0, b = 0;
@@ -387,15 +382,16 @@ ToolOutput tool_set_led_color(const cJSON* args)
     if (!get_int(args, "green", &g, &err, true, 0, 0, 168)) return err;
     if (!get_int(args, "blue", &b, &err, true, 0, 0, 168)) return err;
 
-    LvglLockGuard lock;
-    GetStackChan().leftNeonLight().setColor(r, g, b);
-    GetStackChan().rightNeonLight().setColor(r, g, b);
-    return ok_text("ok");
+    const bool executed = service.ui_execute([r, g, b] {
+        GetStackChan().leftNeonLight().setColor(r, g, b);
+        GetStackChan().rightNeonLight().setColor(r, g, b);
+    });
+    return executed ? ok_text("ok") : ui_error();
 }
 
 // ---------------- reminder tools (ported from hal_mcp.cpp) ----------------
 
-ToolOutput tool_create_reminder(const cJSON* args)
+ToolOutput tool_create_reminder(LanService& service, const cJSON* args)
 {
     ToolOutput err;
     int duration_seconds = 0;
@@ -405,17 +401,20 @@ ToolOutput tool_create_reminder(const cJSON* args)
     if (!get_string(args, "message", &message, &err, false, "Time's up!", 120)) return err;
     if (!get_bool(args, "repeat", &repeat, &err, false, false)) return err;
 
-    const int id = tools::create_reminder((uint32_t)duration_seconds * 1000, message, repeat);
+    const int id = service.create_reminder((uint32_t)duration_seconds * 1000, message, repeat);
+    if (id < 0) {
+        return ui_error();
+    }
     return ok_text(std::to_string(id));
 }
 
-ToolOutput tool_get_reminders(const cJSON*)
+ToolOutput tool_get_reminders(LanService& service, const cJSON*)
 {
     cJSON* array = cJSON_CreateArray();
-    for (const auto& r : tools::get_active_reminders()) {
+    for (const auto& r : service.get_reminders()) {
         cJSON* item = cJSON_CreateObject();
         cJSON_AddNumberToObject(item, "id", r.id);
-        cJSON_AddNumberToObject(item, "duration_ms", (double)r.durationMs);
+        cJSON_AddNumberToObject(item, "duration_ms", (double)r.duration_ms);
         cJSON_AddStringToObject(item, "message", r.message.c_str());
         cJSON_AddBoolToObject(item, "repeat", r.repeat);
         cJSON_AddItemToArray(array, item);
@@ -425,18 +424,20 @@ ToolOutput tool_get_reminders(const cJSON*)
     return ok_json(root);
 }
 
-ToolOutput tool_stop_reminder(const cJSON* args)
+ToolOutput tool_stop_reminder(LanService& service, const cJSON* args)
 {
     ToolOutput err;
     int id = 0;
     if (!get_int(args, "id", &id, &err, true, 0, -1000000, 1000000)) return err;
-    tools::stop_reminder(id);
+    if (!service.stop_reminder(id)) {
+        return ui_error();
+    }
     return ok_text("ok");
 }
 
 // ---------------- camera tool ----------------
 
-ToolOutput tool_take_photo(const cJSON* args)
+ToolOutput tool_take_photo(LanService& service, const cJSON* args)
 {
     ToolOutput err;
     int quality = 0;
@@ -452,14 +453,13 @@ ToolOutput tool_take_photo(const cJSON* args)
     }
 
     cJSON* root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "url", (service_base_url() + "/photo.jpg").c_str());
+    cJSON_AddStringToObject(root, "url", (service.base_url() + "/photo.jpg").c_str());
     cJSON_AddNumberToObject(root, "width", mcp_photo::width());
     cJSON_AddNumberToObject(root, "height", mcp_photo::height());
     {
-        const uint8_t* data = nullptr;
-        size_t len          = 0;
-        if (mcp_photo::get(&data, &len)) {
-            cJSON_AddNumberToObject(root, "size_bytes", (double)len);
+        mcp_photo::PhotoSnapshot snapshot;
+        if (mcp_photo::get(&snapshot)) {
+            cJSON_AddNumberToObject(root, "size_bytes", (double)snapshot.bytes->size());
         }
     }
     cJSON_AddNumberToObject(root, "quality", mcp_photo::quality());
@@ -523,18 +523,18 @@ ToolOutput tool_spk_stream(const cJSON*)
 
 // ---------------- owner tool ----------------
 
-ToolOutput tool_reboot(const cJSON*)
+ToolOutput tool_reboot(LanService& service, const cJSON*)
 {
     // The JSON-RPC layer reboots after the HTTP reply went out.
-    service_request_reboot();
+    service.request_reboot();
     return ok_text("rebooting");
 }
 
 }  // namespace
 
-void register_all_tools()
+void register_all_tools(LanService& service)
 {
-    auto& reg = Registry::instance();
+    auto& reg = service.registry();
 
     reg.add({"self.get_device_status",
              "Get device status: wifi, battery, speaker volume, screen brightness, memory, uptime.",
@@ -560,59 +560,59 @@ void register_all_tools()
     reg.add({"self.display.set_emotion",
              "Set the robot's facial expression. One of: neutral, happy, laughing, angry, sad, crying, sleepy, doubtful.",
              R"({"emotion":{"type":"string","enum":["neutral","happy","laughing","angry","sad","crying","sleepy","doubtful"]}})",
-             tool_set_emotion});
+             [&service](const cJSON* args) { return tool_set_emotion(service, args); }});
     reg.add({"self.display.show_message",
              "Show a speech bubble with text on the robot's screen. duration_ms=0 keeps it until cleared.",
              R"({"text":{"type":"string","maxLength":200},"duration_ms":{"type":"integer","minimum":0,"maximum":600000,"default":10000}})",
-             tool_show_message});
+             [&service](const cJSON* args) { return tool_show_message(service, args); }});
     reg.add({"self.display.clear_message",
              "Clear the speech bubble.",
              R"({})",
-             tool_clear_message});
+             [&service](const cJSON* args) { return tool_clear_message(service, args); }});
 
     reg.add({"self.robot.get_head_angles",
              "Returns current yaw/pitch in degrees. Neutral position is {yaw:0, pitch:0}.",
              R"({})",
-             tool_get_head_angles});
+             [&service](const cJSON* args) { return tool_get_head_angles(service, args); }});
     reg.add({"self.robot.set_head_angles",
              "Adjust head position. GUIDELINES: 1. For natural interaction, stay within +/- 45 degrees. "
              "2. Only use values > 70 if the user explicitly asks to look far away/behind. "
              "3. Max ranges: Yaw(-128 to 128, -128 as your left), Pitch(0 to 90, 90 as your up). "
              "Speed(100-1000, 150 is natural). Omit yaw/pitch to leave it unchanged.",
              R"({"yaw":{"type":"integer","minimum":-128,"maximum":128},"pitch":{"type":"integer","minimum":0,"maximum":90},"speed":{"type":"integer","minimum":100,"maximum":1000,"default":150}})",
-             tool_set_head_angles});
+             [&service](const cJSON* args) { return tool_set_head_angles(service, args); }});
     reg.add({"self.robot.look_at",
              "Point the head at a normalized position. x/y in [-1,1] spans the full motion range.",
              R"({"x":{"type":"number","minimum":-1,"maximum":1},"y":{"type":"number","minimum":-1,"maximum":1}})",
-             tool_look_at});
+             [&service](const cJSON* args) { return tool_look_at(service, args); }});
     reg.add({"self.robot.go_home",
              "Move the head back to the neutral position.",
              R"({})",
-             tool_go_home});
+             [&service](const cJSON* args) { return tool_go_home(service, args); }});
     reg.add({"self.robot.set_led_color",
              "Set the color of the robot's INTERNAL onboard LED. This is NOT for room lights. "
              "Values: 0-168 (safe range). Red=168,0,0; Green=0,168,0; Blue=0,0,168; White=100,100,100; Off=0,0,0.",
              R"({"red":{"type":"integer","minimum":0,"maximum":168},"green":{"type":"integer","minimum":0,"maximum":168},"blue":{"type":"integer","minimum":0,"maximum":168}})",
-             tool_set_led_color});
+             [&service](const cJSON* args) { return tool_set_led_color(service, args); }});
 
     reg.add({"self.robot.create_reminder",
              "Create a reminder. Duration is in seconds. Message is what to say when time is up. Set repeat to true to repeat the reminder.",
              R"({"duration_seconds":{"type":"integer","minimum":1,"maximum":86400},"message":{"type":"string","default":"Time's up!"},"repeat":{"type":"boolean","default":false}})",
-             tool_create_reminder});
+             [&service](const cJSON* args) { return tool_create_reminder(service, args); }});
     reg.add({"self.robot.get_reminders",
              "Get list of active reminders.",
              R"({})",
-             tool_get_reminders});
+             [&service](const cJSON* args) { return tool_get_reminders(service, args); }});
     reg.add({"self.robot.stop_reminder",
              "Stop a reminder by ID.",
              R"({"id":{"type":"integer"}})",
-             tool_stop_reminder});
+             [&service](const cJSON* args) { return tool_stop_reminder(service, args); }});
 
     reg.add({"self.camera.take_photo",
              "Capture a photo (320x240) and return its URL served by the device. Takes 0.5-1 s. "
              "Set embed=true to also inline the JPEG as base64 (larger response).",
              R"({"quality":{"type":"integer","minimum":1,"maximum":100,"default":20},"embed":{"type":"boolean","default":false}})",
-             tool_take_photo});
+             [&service](const cJSON* args) { return tool_take_photo(service, args); }});
 
     reg.add({"self.microphone.stream",
              "Start listening: returns a WebSocket URL streaming Opus audio (16 kHz mono 60 ms frames). "
@@ -629,7 +629,7 @@ void register_all_tools()
     reg.add({"self.reboot",
              "OWNER ONLY. Reboot the device (1 s after the reply).",
              R"({})",
-             tool_reboot});
+             [&service](const cJSON* args) { return tool_reboot(service, args); }});
 #endif
 }
 

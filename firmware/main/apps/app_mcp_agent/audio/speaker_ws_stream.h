@@ -40,6 +40,10 @@
 //            {"type":"error","message":"busy"}. Incoming packets are
 //            shallow-buffered (a fraction of a second); a sender that
 //            outruns the speaker drops frames.
+namespace mcp_lan {
+class LanService;
+}
+
 class SpeakerWsStream {
 public:
     static SpeakerWsStream& GetInstance()
@@ -50,10 +54,18 @@ public:
 
     // Registers the /speaker WebSocket handler on `server` and spawns the
     // playback task (idle until a client claims the stream).
-    bool Start(httpd_handle_t server);
+    bool Start(httpd_handle_t server, mcp_lan::LanService& service);
 
     // Unregisters the handler, disconnects the client and stops playback.
     void Stop();
+
+    static bool Stopped()
+    {
+        auto& self = GetInstance();
+        return self.server_ == nullptr &&
+               (self.playback_task_ == nullptr || self.task_exited_.load());
+    }
+    static void Reclaim();
 
     // True while a client holds the playback stream.
     static bool IsActive()
@@ -64,6 +76,8 @@ public:
     // Remaining free stack of the playback task in bytes (-1 when not
     // running) — telemetry for GET /.
     static int StackHighWaterBytes();
+
+    static void HandleDisconnect(httpd_handle_t server, int fd);
 
 private:
     SpeakerWsStream() = default;
@@ -78,6 +92,7 @@ private:
     bool EnsurePlaybackTask();
 
     httpd_handle_t server_ = nullptr;
+    mcp_lan::LanService* mcp_service_ = nullptr;
     TaskHandle_t playback_task_ = nullptr;
     std::atomic<bool> running_{false};
     std::atomic<bool> task_exited_{false};

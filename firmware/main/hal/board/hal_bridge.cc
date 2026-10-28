@@ -147,13 +147,6 @@ void set_xiaozhi_config(const XiaozhiConfig_t& config)
 
 void app_play_sound(const std::string_view& sound)
 {
-    if (!is_xiaozhi_ready()) {
-        // No xiaozhi application is running (e.g. inside the MCP Agent
-        // app): the audio service does not exist and PlaySound would block
-        // forever on its event loop (observed hanging the whole device on
-        // a camera capture). Nothing to play then.
-        return;
-    }
     auto& app = Application::GetInstance();
     app.PlaySound(sound);
 }

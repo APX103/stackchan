@@ -34,16 +34,14 @@ AudioCodec* audio_codec();
 // use separate I2S rx/tx channels and do NOT need this lock.
 std::mutex& codec_mutex();
 
-// Forces construction of the audio codec singleton NOW. The codec (and its
-// I2S channels + DMA buffers) is created lazily on first use; if that first
-// use happens late in the boot (e.g. the MCP Agent app opening after Wi-Fi
-// is up), the I2S channel allocation fails with NO_MEM and the
-// ESP_ERROR_CHECK inside aborts the whole system. Called once from app_main.
-void audio_codec_warmup();
-
 // The camera singleton (parent repo class, may be nullptr).
 StackChanCamera* camera();
 
+// Starts network initialization without waiting for a connection.
+void wifi_start();
+// Used only during the MCP-to-AI handoff. A fresh StartNetwork() is needed
+// because an already-active Station does not emit Connected again.
+void wifi_stop_for_ai_handoff();
 // Wi-Fi state via the 78/esp-wifi-connect managed component (not xiaozhi).
 bool wifi_connected();
 std::string wifi_ip();
