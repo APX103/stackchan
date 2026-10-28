@@ -61,7 +61,7 @@ int wifi_rssi()
     return WifiManager::GetInstance().GetRssi();
 }
 
-static wifi_ps_mode_t saved_power_save_mode = WIFI_PS_NONE;
+static wifi_ps_type_t saved_power_save_mode = WIFI_PS_NONE;
 static bool has_saved_power_save_mode = false;
 
 void wifi_set_no_power_save()
@@ -83,7 +83,7 @@ void wifi_restore_power_save()
     if (!has_saved_power_save_mode) {
         return;
     }
-    const wifi_ps_mode_t mode = saved_power_save_mode;
+    const wifi_ps_type_t mode = saved_power_save_mode;
     has_saved_power_save_mode = false;
     const esp_err_t err = esp_wifi_set_ps(mode);
     if (err == ESP_OK) {
