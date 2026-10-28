@@ -81,3 +81,6 @@ CONFIG_LV_USE_SNAPSHOT=y
 CONFIG_LV_USE_IMGFONT=y
 CONFIG_LV_BUILD_EXAMPLES=n
 CONFIG_LV_BUILD_DEMOS=n
+
+# WebSocket support in esp_http_server (needed by the MCP Agent audio streams)
+CONFIG_HTTPD_WS_SUPPORT=y
