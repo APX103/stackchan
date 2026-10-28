@@ -150,8 +150,12 @@ esp_err_t MicWsStream::WsHandler(httpd_req_t* req) {
                 const bool restarting = self.capture_task_ != nullptr && !self.task_exited_.load();
                 self.client_fd_ = -1;
                 self.session_++;
+                if (self.mcp_service_ != nullptr) {
+                    self.mcp_service_->push_event(restarting ? "mic: capture task is restarting" :
+                                                               "mic: audio init failed; see serial log");
+                }
                 return wsutil::SendError(req, restarting ? "capture task is restarting" :
-                                                          "no memory for capture task");
+                                                          "audio unavailable or no memory for capture task");
             }
             ESP_LOGI(TAG, "client fd %d started streaming", fd);
             if (self.mcp_service_ != nullptr) {
@@ -192,7 +196,7 @@ esp_err_t MicWsStream::WsHandler(httpd_req_t* req) {
 void MicWsStream::CaptureTask(void* arg) {
     auto& self = *static_cast<MicWsStream*>(arg);
 
-    auto* codec = mcp_dev::audio_codec();
+    auto* codec = mcp_dev::audio_codec("mic capture");
     if (codec == nullptr) {
         ESP_LOGE(TAG, "board has no audio codec, mic stream disabled");
         self.client_fd_ = -1;
@@ -453,7 +457,7 @@ bool MicWsStream::EnsureCaptureTask() {
     // Construct the public codec before reserving the large task stack. Its
     // DMA allocation uses ESP_ERROR_CHECK; doing it afterwards can reset the
     // device instead of returning a stream-start error on a busy heap.
-    if (mcp_dev::audio_codec() == nullptr) {
+    if (mcp_dev::audio_codec("mic capture") == nullptr) {
         return false;
     }
     // Clean up a previously parked task first (its stack is still held

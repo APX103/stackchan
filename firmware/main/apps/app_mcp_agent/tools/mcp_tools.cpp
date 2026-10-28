@@ -414,7 +414,7 @@ ToolOutput tool_get_reminders(LanService& service, const cJSON*)
     for (const auto& r : service.get_reminders()) {
         cJSON* item = cJSON_CreateObject();
         cJSON_AddNumberToObject(item, "id", r.id);
-        cJSON_AddNumberToObject(item, "duration_ms", (double)r.duration_ms);
+        cJSON_AddNumberToObject(item, "duration_ms", (double)r.durationMs);
         cJSON_AddStringToObject(item, "message", r.message.c_str());
         cJSON_AddBoolToObject(item, "repeat", r.repeat);
         cJSON_AddItemToArray(array, item);

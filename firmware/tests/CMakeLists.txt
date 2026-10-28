@@ -17,14 +17,6 @@ target_compile_features(motion_math_test PRIVATE cxx_std_17)
 
 add_test(NAME motion_math_test COMMAND $<TARGET_FILE:motion_math_test>)
 
-add_executable(mcp_reminder_store_test
-    mcp_reminder_store_test.cpp
-    ../main/apps/app_mcp_agent/service/reminder_store.cpp
-)
-target_include_directories(mcp_reminder_store_test PRIVATE ../main)
-target_compile_features(mcp_reminder_store_test PRIVATE cxx_std_17)
-add_test(NAME mcp_reminder_store_test COMMAND $<TARGET_FILE:mcp_reminder_store_test>)
-
 add_executable(mcp_ui_pending_test mcp_ui_pending_test.cpp)
 target_include_directories(mcp_ui_pending_test PRIVATE ../main)
 target_compile_features(mcp_ui_pending_test PRIVATE cxx_std_17)

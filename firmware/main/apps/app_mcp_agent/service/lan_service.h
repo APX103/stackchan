@@ -20,9 +20,11 @@
 #include <string>
 
 #include "../protocol/mcp_registry.h"
-#include "reminder_store.h"
+#include "apps/common/reminder/reminder.h"
 
 namespace mcp_lan {
+
+using ReminderInfo = tools::ReminderInfo_t;
 
 struct ServiceStatus {
     bool running = false;
@@ -40,7 +42,7 @@ struct ServiceStatus {
 
 // App-owned lifecycle and execution context. No method in this class is a
 // process-global singleton: the application decides when it is created and
-// destroyed. Hardware facades in platform/ remain stateless API adapters.
+// destroyed.
 class LanService {
 public:
     using UiAction = std::function<void()>;
@@ -87,6 +89,7 @@ public:
     void push_event(const char* fmt, ...);
     void request_reboot();
     bool consume_reboot_request();
+    bool http_authorized(httpd_req_t* req);
     bool ws_authorized(httpd_req_t* req);
     std::string base_url();
 

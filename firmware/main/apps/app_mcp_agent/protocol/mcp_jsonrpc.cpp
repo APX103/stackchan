@@ -28,29 +28,6 @@ namespace {
 const char* kServerName = "stackchan-mcp";
 const char* kServerVersion = "1.0.0";
 
-bool token_configured()
-{
-    return strlen(CONFIG_MCP_AGENT_TOKEN) > 0;
-}
-
-bool token_matches(const char* header_value)
-{
-    if (header_value == nullptr || strncmp(header_value, "Bearer ", 7) != 0) {
-        return false;
-    }
-    const char* presented = header_value + 7;
-    const char* expected = CONFIG_MCP_AGENT_TOKEN;
-    const size_t presented_len = strlen(presented);
-    const size_t expected_len = strlen(expected);
-    volatile unsigned char diff = presented_len == expected_len ? 0 : 1;
-    for (size_t i = 0; i < expected_len; ++i) {
-        if (i < presented_len) {
-            diff |= (unsigned char)(presented[i] ^ expected[i]);
-        }
-    }
-    return diff == 0;
-}
-
 esp_err_t send_json(httpd_req_t* req, const std::string& body, const char* status = "200 OK")
 {
     httpd_resp_set_status(req, status);
@@ -176,12 +153,8 @@ esp_err_t handle_tools_call(LanService& service, httpd_req_t* req, cJSON* id, co
 esp_err_t mcp_handler(httpd_req_t* req)
 {
     auto& service = *static_cast<LanService*>(req->user_ctx);
-    if (token_configured()) {
-        char auth[160];
-        const esp_err_t got = httpd_req_get_hdr_value_str(req, "Authorization", auth, sizeof(auth));
-        if (got != ESP_OK || !token_matches(auth)) {
-            return send_json(req, make_error_json(nullptr, -32001, "unauthorized"), "401 Unauthorized");
-        }
+    if (!service.http_authorized(req)) {
+        return send_json(req, make_error_json(nullptr, -32001, "unauthorized"), "401 Unauthorized");
     }
     service.note_request();
 

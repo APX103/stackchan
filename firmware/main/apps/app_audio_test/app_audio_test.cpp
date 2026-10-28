@@ -522,6 +522,7 @@ void AppAudioTest::run_tones_mode()
     }
     GetHAL().setSpeakerVolume(_saved_volume);
     _volume_saved = false;
+    _task_mode.store((int)TaskMode::Idle);
     _tones_done.store(true);
 }
 

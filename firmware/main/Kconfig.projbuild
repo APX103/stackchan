@@ -33,9 +33,10 @@ config MCP_AGENT_TOKEN
     string "MCP Agent bearer token (empty = no auth)"
     default ""
     help
-        When non-empty, /mcp requires "Authorization: Bearer <token>" and
-        the WebSocket endpoints require "?token=<token>" on the query
-        string. Traffic is still plain HTTP (LAN threat model).
+        When non-empty, /mcp and /photo.jpg require
+        "Authorization: Bearer <token>"; the WebSocket endpoints require
+        "?token=<token>" on the query string. Traffic is still plain HTTP
+        (LAN threat model).
 
 config MCP_AGENT_ENABLE_OWNER_TOOLS
     bool "Expose owner-only tools (self.reboot) over LAN"
@@ -50,7 +51,7 @@ menu "Audio Test"
 
 config AUDIO_TEST_ENABLE
     bool "Enable the standalone AUDIO.TEST app"
-    default y
+    default n
     help
         Installs AUDIO.TEST independently of MCP Agent. Its audio task and
         FFT resources are created only while the app is in use.

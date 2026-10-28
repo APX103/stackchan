@@ -22,8 +22,8 @@
 namespace mcp_dev {
 
 // The board's audio codec singleton (CoreS3AudioCodec, implemented in this
-// repo). Returns nullptr if the board has none.
-AudioCodec* audio_codec();
+// repo). Returns nullptr if the board has none or the heap preflight fails.
+AudioCodec* audio_codec(const char* consumer);
 
 // Serializes all codec CONTROL calls (EnableInput/EnableOutput/Start and
 // friends). The mic and speaker stream tasks initialize their codec sides
@@ -51,5 +51,6 @@ int wifi_rssi();
 // default power save makes the device stop answering ARP within a minute
 // of going idle.
 void wifi_set_no_power_save();
+void wifi_restore_power_save();
 
 }  // namespace mcp_dev

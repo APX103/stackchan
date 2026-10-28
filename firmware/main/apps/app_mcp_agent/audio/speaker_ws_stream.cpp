@@ -33,7 +33,7 @@ constexpr int kFrameMs = 60;
 void SpeakerWsStream::PlaybackTask(void* arg) {
     auto& self = *static_cast<SpeakerWsStream*>(arg);
 
-    auto* codec = mcp_dev::audio_codec();
+    auto* codec = mcp_dev::audio_codec("speaker playback");
     if (codec == nullptr) {
         ESP_LOGE(TAG, "board has no audio codec, speaker stream disabled");
         self.task_exited_ = true;
@@ -209,8 +209,12 @@ esp_err_t SpeakerWsStream::WsHandler(httpd_req_t* req) {
             if (!self.EnsurePlaybackTask()) {
                 const bool restarting = self.playback_task_ != nullptr && !self.task_exited_.load();
                 self.client_fd_ = -1;
+                if (self.mcp_service_ != nullptr) {
+                    self.mcp_service_->push_event(restarting ? "speaker: playback task is restarting" :
+                                                               "speaker: audio init failed; see serial log");
+                }
                 return wsutil::SendError(req, restarting ? "playback task is restarting" :
-                                                          "no memory for playback task");
+                                                          "audio unavailable or no memory for playback task");
             }
             ESP_LOGI(TAG, "client fd %d started playback", fd);
             if (self.mcp_service_ != nullptr) {
@@ -303,7 +307,7 @@ void SpeakerWsStream::Reclaim() {
 }
 
 bool SpeakerWsStream::EnsurePlaybackTask() {
-    if (mcp_dev::audio_codec() == nullptr) {
+    if (mcp_dev::audio_codec("speaker playback") == nullptr) {
         return false;
     }
     // Clean up a previously parked task first.

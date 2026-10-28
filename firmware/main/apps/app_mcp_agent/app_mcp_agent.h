@@ -17,7 +17,7 @@
 #include <memory>
 #include <string>
 
-#include "service/reminder_store.h"
+#include "apps/common/reminder/reminder.h"
 #include "service/ui_pending.h"
 
 namespace mcp_lan {
@@ -49,18 +49,18 @@ private:
     void show_message(const std::string& text, uint32_t duration_ms);
     void clear_message();
     int create_reminder(uint32_t duration_ms, const std::string& message, bool repeat);
-    std::vector<mcp_lan::ReminderInfo> get_reminders();
+    std::vector<tools::ReminderInfo_t> get_reminders();
     void stop_reminder(int id);
     static void speech_timer_cb(lv_timer_t* timer);
 
     std::mutex _ui_jobs_mtx;
     std::deque<UiJob> _ui_jobs;
     lv_timer_t* _speech_timer = nullptr;
-    mcp_lan::ReminderStore _reminders;
 
     std::unique_ptr<uitk::lvgl_cpp::Label> _label_ip_hint;
     std::unique_ptr<mcp_lan::LanService> _service;
     unsigned _pet_conn = 0;  // head-pet gesture observability connection
+    unsigned _reminder_conn = 0;
     int _breath_modifier_id = -1;
     int _blink_modifier_id = -1;
     int _headpet_modifier_id = -1;

@@ -104,6 +104,10 @@ esp_err_t status_handler(httpd_req_t* req)
 
 esp_err_t photo_handler(httpd_req_t* req)
 {
+    auto& service = *static_cast<LanService*>(req->user_ctx);
+    if (!service.http_authorized(req)) {
+        return send_json(req, make_error_json(nullptr, -32001, "unauthorized"), "401 Unauthorized");
+    }
     mcp_photo::PhotoSnapshot snapshot;
     if (!mcp_photo::get(&snapshot)) {
         httpd_resp_set_status(req, "404 Not Found");
@@ -586,6 +590,29 @@ bool LanService::consume_reboot_request()
     const bool requested = stats_.reboot_requested;
     stats_.reboot_requested = false;
     return requested;
+}
+
+bool LanService::http_authorized(httpd_req_t* req)
+{
+    if (strlen(CONFIG_MCP_AGENT_TOKEN) == 0) {
+        return true;
+    }
+    char auth[160];
+    if (httpd_req_get_hdr_value_str(req, "Authorization", auth, sizeof(auth)) != ESP_OK ||
+        strncmp(auth, "Bearer ", 7) != 0) {
+        return false;
+    }
+    const char* presented = auth + 7;
+    const char* expected = CONFIG_MCP_AGENT_TOKEN;
+    const size_t presented_len = strlen(presented);
+    const size_t expected_len = strlen(expected);
+    volatile unsigned char diff = presented_len == expected_len ? 0 : 1;
+    for (size_t i = 0; i < expected_len; ++i) {
+        if (i < presented_len) {
+            diff |= (unsigned char)(presented[i] ^ expected[i]);
+        }
+    }
+    return diff == 0;
 }
 
 bool LanService::ws_authorized(httpd_req_t* req)

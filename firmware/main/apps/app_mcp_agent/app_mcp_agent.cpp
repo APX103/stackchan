@@ -103,6 +103,13 @@ void AppMcpAgent::onOpen()
                 _service->push_event("headpet gesture %d", (int)g);
             }
         });
+        _reminder_conn = tools::on_reminder_triggered().connect([this](int, std::string_view message) {
+            LvglLockGuard lock;
+            if (GetStackChan().hasAvatar()) {
+                GetStackChan().avatar().addDecorator(
+                    std::make_unique<view::ReminderView>(lv_screen_active(), message));
+            }
+        });
 
         // Common widgets (status bar + home indicator at the bottom to exit)
         view::create_home_indicator([this]() {
@@ -185,13 +192,11 @@ void AppMcpAgent::onRunning()
         _last_refresh_ms = 0;
     }
 
+    tools::update_reminders();
     {
         LvglLockGuard lock;
 
         process_ui_jobs();
-        _reminders.tick(GetHAL().millis(), [this](const mcp_lan::ReminderInfo& reminder) {
-            show_message(reminder.message, 5000);
-        });
         GetStackChan().update();
 
         view::update_home_indicator();
@@ -243,7 +248,6 @@ void AppMcpAgent::onClose()
             _headpet_modifier_id = -1;
         }
         clear_message();
-        _reminders.clear();
         cancel_ui_jobs();
         GetStackChan().resetAvatar();
 
@@ -251,12 +255,17 @@ void AppMcpAgent::onClose()
             GetHAL().onHeadPetGesture.disconnect(_pet_conn);
             _pet_conn = 0;
         }
+        if (_reminder_conn != 0) {
+            tools::on_reminder_triggered().disconnect(_reminder_conn);
+            _reminder_conn = 0;
+        }
         _label_ip_hint.reset();
 
         view::destroy_home_indicator();
         view::destroy_status_bar();
     }
     _service.reset();
+    mcp_dev::wifi_restore_power_save();
     _closing = false;
 }
 
@@ -396,15 +405,15 @@ void AppMcpAgent::speech_timer_cb(lv_timer_t* timer)
 
 int AppMcpAgent::create_reminder(uint32_t duration_ms, const std::string& message, bool repeat)
 {
-    return _reminders.create(GetHAL().millis(), duration_ms, message, repeat);
+    return tools::create_reminder(duration_ms, message, repeat);
 }
 
-std::vector<mcp_lan::ReminderInfo> AppMcpAgent::get_reminders()
+std::vector<tools::ReminderInfo_t> AppMcpAgent::get_reminders()
 {
-    return _reminders.active();
+    return tools::get_active_reminders();
 }
 
 void AppMcpAgent::stop_reminder(int id)
 {
-    _reminders.stop(id);
+    tools::stop_reminder(id);
 }
