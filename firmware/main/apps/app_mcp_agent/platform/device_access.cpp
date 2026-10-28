@@ -6,53 +6,24 @@
 #include "device_access.h"
 
 #include <board.h>
-#include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_system.h>
 #include <esp_wifi.h>
 #include <wifi_manager.h>
 #include <wifi_station.h>
 
+#include "apps/common/audio/codec_access.h"
+
 namespace mcp_dev {
 
 std::mutex& codec_mutex()
 {
-    static std::mutex mutex;
-    return mutex;
+    return common_audio::codec_mutex();
 }
 
 AudioCodec* audio_codec(const char* consumer)
 {
-    static AudioCodec* cached_codec = nullptr;
-    std::lock_guard<std::mutex> lock(codec_mutex());
-    if (cached_codec != nullptr) {
-        return cached_codec;
-    }
-
-    constexpr uint32_t caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA;
-    constexpr size_t min_free = 48 * 1024;
-    constexpr size_t min_largest = 16 * 1024;
-    const size_t free = heap_caps_get_free_size(caps);
-    const size_t largest = heap_caps_get_largest_free_block(caps);
-    ESP_LOGI("McpDevice", "%s: codec init preflight: internal free=%u, largest=%u", consumer,
-             (unsigned)free, (unsigned)largest);
-    if (free < min_free || largest < min_largest) {
-        ESP_LOGE("McpDevice",
-                 "%s: refusing codec init: need at least %u free and a %u-byte contiguous block; "
-                 "the HAL constructor aborts on allocation failure",
-                 consumer, (unsigned)min_free, (unsigned)min_largest);
-        return nullptr;
-    }
-
-    ESP_LOGI("McpDevice", "%s: entering Board::GetAudioCodec()", consumer);
-    cached_codec = Board::GetInstance().GetAudioCodec();
-    if (cached_codec == nullptr) {
-        ESP_LOGE("McpDevice", "%s: board returned no audio codec", consumer);
-        return nullptr;
-    }
-    ESP_LOGI("McpDevice", "%s: codec init completed: internal free=%u, largest=%u", consumer,
-             (unsigned)heap_caps_get_free_size(caps), (unsigned)heap_caps_get_largest_free_block(caps));
-    return cached_codec;
+    return common_audio::codec(consumer);
 }
 
 StackChanCamera* camera()

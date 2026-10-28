@@ -79,10 +79,9 @@ public:
     ServiceStatus status();
     Registry& registry() { return registry_; }
 
-    // Called by the JSON-RPC endpoint after it has created an async request.
-    // Ownership of args, id, and async_req transfers to the service on every
-    // path, including queue-full and startup-failure responses.
-    void submit_tool(const Tool* tool, cJSON* args, cJSON* id, httpd_req_t* async_req);
+    // Admits the job before creating an async request, so immediate failures
+    // are always answered synchronously on the HTTPD thread.
+    esp_err_t submit_tool(const Tool* tool, cJSON* args, cJSON* id, httpd_req_t* req);
 
     void note_request();
     void note_tool_result(bool is_error);
@@ -104,10 +103,13 @@ private:
         std::condition_variable cv;
         std::deque<uint64_t> queue;
         std::map<uint64_t, JobPtr> active;
+        size_t beginning = 0;
         bool closing = false;
         bool started = false;
         std::atomic<bool> exited{true};
         TaskHandle_t task = nullptr;
+        std::atomic<bool> timeout_exited{true};
+        TaskHandle_t timeout_task = nullptr;
     };
 
     struct Stats {
@@ -134,7 +136,6 @@ private:
     Executor executor_;
     Stats stats_;
     std::atomic<httpd_handle_t> httpd_{nullptr};
-    esp_timer_handle_t watchdog_ = nullptr;
     std::atomic<bool> running_{false};
     uint64_t next_job_id_ = 1;
 };

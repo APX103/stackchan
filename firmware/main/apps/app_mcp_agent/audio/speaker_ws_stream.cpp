@@ -16,6 +16,8 @@
 #include <string.h>
 
 #include <chrono>
+#include <exception>
+#include <new>
 
 #include "codec_bus.h"
 #include "../platform/device_access.h"
@@ -30,20 +32,54 @@ static const char* TAG = "SpkWs";
 constexpr size_t kMaxQueuedPackets = 8;
 constexpr int kFrameMs = 60;
 
+namespace {
+class PlaybackCodecGuard {
+public:
+    explicit PlaybackCodecGuard(AudioCodec* codec) : codec_(codec) {}
+    ~PlaybackCodecGuard() { release(); }
+    void release()
+    {
+        if (codec_ != nullptr) {
+            mcp_audio::release_output(codec_);
+            codec_ = nullptr;
+        }
+    }
+private:
+    AudioCodec* codec_;
+};
+struct OpusDecoderDeleter {
+    void operator()(void* decoder) const { if (decoder != nullptr) esp_opus_dec_close(decoder); }
+};
+}  // namespace
+
 void SpeakerWsStream::PlaybackTask(void* arg) {
+    auto& self = *static_cast<SpeakerWsStream*>(arg);
+    try {
+        PlaybackTaskImpl(arg);
+    } catch (const std::exception& e) {
+        ESP_LOGE(TAG, "playback task aborted: %s", e.what());
+    } catch (...) {
+        ESP_LOGE(TAG, "playback task aborted: unknown exception");
+    }
+    self.running_ = false;
+    self.client_fd_ = -1;
+    self.task_exited_ = true;
+    vTaskDelay(portMAX_DELAY);
+}
+
+void SpeakerWsStream::PlaybackTaskImpl(void* arg) {
     auto& self = *static_cast<SpeakerWsStream*>(arg);
 
     auto* codec = mcp_dev::audio_codec("speaker playback");
     if (codec == nullptr) {
         ESP_LOGE(TAG, "board has no audio codec, speaker stream disabled");
-        self.task_exited_ = true;
-        vTaskDelay(portMAX_DELAY);  // WithCaps tasks must not self-delete
         return;
     }
     // The duplex I2S bus is clocked from the output side and the mic capture
     // task already opened it; these calls are idempotent covers for the case
     // where it has not. Control calls are serialized against the mic task.
     mcp_audio::acquire_output(codec);
+    PlaybackCodecGuard codec_guard(codec);
     {
         std::lock_guard<std::mutex> lock(mcp_dev::codec_mutex());
         codec->Start();
@@ -52,6 +88,7 @@ void SpeakerWsStream::PlaybackTask(void* arg) {
     // The decoder is opened lazily on the first packet: while the speaker is
     // unused the ~30 KB it needs stay available to the rest of the system.
     void* decoder = nullptr;
+    std::unique_ptr<void, OpusDecoderDeleter> decoder_guard(nullptr);
     // Opus frame of 60 ms at the codec output rate (24 kHz -> 1440 samples).
     const size_t frame_samples = codec->output_sample_rate() / 1000 * kFrameMs;
     std::vector<int16_t> pcm(frame_samples);
@@ -96,6 +133,7 @@ void SpeakerWsStream::PlaybackTask(void* arg) {
                 decoder = nullptr;
                 continue;
             }
+            decoder_guard.reset(decoder);
             ESP_LOGI(TAG, "playback task ready (opus -> %d Hz)", codec->output_sample_rate());
         }
 
@@ -123,14 +161,9 @@ void SpeakerWsStream::PlaybackTask(void* arg) {
         }
     }
 
-    if (decoder != nullptr) {
-        esp_opus_dec_close(decoder);
-    }
-    mcp_audio::release_output(codec);
+    decoder_guard.reset();
+    codec_guard.release();
     ESP_LOGI(TAG, "playback task stopped (%u packets played)", (unsigned)played);
-    self.task_exited_ = true;
-    // WithCaps tasks must NOT self-delete: park here, the owner deletes us.
-    vTaskDelay(portMAX_DELAY);
 }
 
 void SpeakerWsStream::HandleDisconnect(httpd_handle_t server, int fd) {
@@ -152,11 +185,35 @@ void SpeakerWsStream::HandleDisconnect(httpd_handle_t server, int fd) {
     }
 }
 
+esp_err_t SpeakerWsStream::WsPreHandshake(httpd_req_t* req) {
+    auto& self = GetInstance();
+    if (self.mcp_service_ == nullptr || !self.mcp_service_->running() ||
+        !self.mcp_service_->ws_authorized(req)) {
+        httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "unauthorized");
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
 esp_err_t SpeakerWsStream::WsHandler(httpd_req_t* req) {
+    try {
+        return WsHandlerImpl(req);
+    } catch (const std::bad_alloc&) {
+        ESP_LOGE(TAG, "speaker WS request aborted: out of memory");
+        wsutil::SendError(req, "out of memory");
+    } catch (...) {
+        ESP_LOGE(TAG, "speaker WS request aborted: unknown exception");
+        wsutil::SendError(req, "internal error");
+    }
+    return ESP_FAIL;
+}
+
+esp_err_t SpeakerWsStream::WsHandlerImpl(httpd_req_t* req) {
     auto& self = GetInstance();
 
     // NOTE: no method check here — same reasoning as MicWsStream.
-    if (self.mcp_service_ == nullptr || !self.mcp_service_->ws_authorized(req)) {
+    if (self.mcp_service_ == nullptr || !self.mcp_service_->running() ||
+        !self.mcp_service_->ws_authorized(req)) {
         wsutil::SendError(req, "unauthorized");
         return ESP_FAIL;  // close the session
     }
@@ -280,7 +337,10 @@ bool SpeakerWsStream::Start(httpd_handle_t server, mcp_lan::LanService& service)
     ws_speaker.handler                  = WsHandler;
     ws_speaker.is_websocket             = true;
     ws_speaker.handle_ws_control_frames = false;
-    if (httpd_register_uri_handler(server_, &ws_speaker) != ESP_OK) {
+#if CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT
+    ws_speaker.ws_pre_handshake_cb = WsPreHandshake;
+#endif
+    if (httpd_register_uri_handler(server, &ws_speaker) != ESP_OK) {
         ESP_LOGE(TAG, "failed to register /speaker ws handler");
         server_ = nullptr;
         return false;
@@ -340,7 +400,6 @@ void SpeakerWsStream::Stop() {
         return;
     }
     client_fd_ = -1;
-    httpd_unregister_uri(server_, "/speaker");
     running_ = false;
     queue_cv_.notify_all();
     // The playback task owns decoder and codec cleanup. It is reclaimed by

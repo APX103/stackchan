@@ -14,7 +14,9 @@
 #include <freertos/idf_additions.h>
 #include <string.h>
 
+#include <exception>
 #include <memory>
+#include <new>
 #include <string>
 #include <vector>
 #include <cstdlib>
@@ -60,9 +62,41 @@ void ws_send_job(void* arg) {
         // Session is gone (client disconnected): free the stream so the
         // capture task stops feeding a dead socket.
         MicWsStream::ReleaseClient(job->fd, job->session);
+    } else {
+        httpd_sess_update_lru_counter(job->server, job->fd);
     }
     delete job;
 }
+
+class CaptureCodecGuard {
+public:
+    explicit CaptureCodecGuard(AudioCodec* codec) : codec_(codec) {}
+    ~CaptureCodecGuard() { release(); }
+
+    void release()
+    {
+        if (codec_ == nullptr) return;
+        {
+            std::lock_guard<std::mutex> lock(mcp_dev::codec_mutex());
+            codec_->EnableInput(false);
+        }
+        mcp_audio::release_output(codec_);
+        codec_ = nullptr;
+    }
+
+private:
+    AudioCodec* codec_;
+};
+
+struct OpusEncoderDeleter {
+    void operator()(void* encoder) const { if (encoder != nullptr) esp_opus_enc_close(encoder); }
+};
+struct ResamplerDeleter {
+    void operator()(esp_ae_rate_cvt_handle_t resampler) const {
+        if (resampler != nullptr) esp_ae_rate_cvt_close(resampler);
+    }
+};
+
 }  // namespace
 
 int MicWsStream::StackHighWaterBytes() {
@@ -97,7 +131,30 @@ void MicWsStream::HandleDisconnect(httpd_handle_t server, int fd) {
     ReleaseClient(fd, self.session_.load());
 }
 
+esp_err_t MicWsStream::WsPreHandshake(httpd_req_t* req) {
+    auto& self = MicWsStream::GetInstance();
+    if (self.mcp_service_ == nullptr || !self.mcp_service_->running() ||
+        !self.mcp_service_->ws_authorized(req)) {
+        httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "unauthorized");
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
 esp_err_t MicWsStream::WsHandler(httpd_req_t* req) {
+    try {
+        return WsHandlerImpl(req);
+    } catch (const std::bad_alloc&) {
+        ESP_LOGE(TAG, "mic WS request aborted: out of memory");
+        wsutil::SendError(req, "out of memory");
+    } catch (...) {
+        ESP_LOGE(TAG, "mic WS request aborted: unknown exception");
+        wsutil::SendError(req, "internal error");
+    }
+    return ESP_FAIL;
+}
+
+esp_err_t MicWsStream::WsHandlerImpl(httpd_req_t* req) {
     auto& self = MicWsStream::GetInstance();
 
     // NOTE: no method check here. This handler is invoked once per incoming
@@ -106,7 +163,8 @@ esp_err_t MicWsStream::WsHandler(httpd_req_t* req) {
     // would write a plain HTTP response into the stream and corrupt the
     // protocol.
 
-    if (self.mcp_service_ == nullptr || !self.mcp_service_->ws_authorized(req)) {
+    if (self.mcp_service_ == nullptr || !self.mcp_service_->running() ||
+        !self.mcp_service_->ws_authorized(req)) {
         wsutil::SendError(req, "unauthorized");
         return ESP_FAIL;  // close the session
     }
@@ -195,17 +253,32 @@ esp_err_t MicWsStream::WsHandler(httpd_req_t* req) {
 
 void MicWsStream::CaptureTask(void* arg) {
     auto& self = *static_cast<MicWsStream*>(arg);
+    try {
+        CaptureTaskImpl(arg);
+    } catch (const std::exception& e) {
+        ESP_LOGE(TAG, "capture task aborted: %s", e.what());
+    } catch (...) {
+        ESP_LOGE(TAG, "capture task aborted: unknown exception");
+    }
+    self.running_ = false;
+    self.client_fd_ = -1;
+    self.session_++;
+    self.task_exited_ = true;
+    vTaskDelay(portMAX_DELAY);
+}
+
+void MicWsStream::CaptureTaskImpl(void* arg) {
+    auto& self = *static_cast<MicWsStream*>(arg);
 
     auto* codec = mcp_dev::audio_codec("mic capture");
     if (codec == nullptr) {
         ESP_LOGE(TAG, "board has no audio codec, mic stream disabled");
         self.client_fd_ = -1;
         self.session_++;
-        self.task_exited_ = true;
-        vTaskDelay(portMAX_DELAY);  // WithCaps tasks must not self-delete
         return;
     }
     mcp_audio::acquire_output(codec);
+    CaptureCodecGuard codec_guard(codec);
     {
         // The speaker task initializes its codec side at the same time;
         // control calls must not interleave (see device_access.h).
@@ -221,6 +294,7 @@ void MicWsStream::CaptureTask(void* arg) {
     const uint32_t in_rate_config = codec->input_sample_rate();
     const bool need_resample      = in_rate_config != kOpusSampleRate;
     esp_ae_rate_cvt_handle_t resampler = nullptr;
+    std::unique_ptr<void, ResamplerDeleter> resampler_guard(nullptr);
     if (need_resample) {
         esp_ae_rate_cvt_cfg_t rs_cfg  = {};
         rs_cfg.src_rate               = in_rate_config;
@@ -230,18 +304,12 @@ void MicWsStream::CaptureTask(void* arg) {
         rs_cfg.complexity             = 2;
         rs_cfg.perf_type              = ESP_AE_RATE_CVT_PERF_TYPE_SPEED;
         if (esp_ae_rate_cvt_open(&rs_cfg, &resampler) != ESP_AE_ERR_OK) {
-        ESP_LOGE(TAG, "failed to open resampler %lu->%d", in_rate_config, kOpusSampleRate);
-        self.client_fd_ = -1;
-        self.session_++;
-        {
-            std::lock_guard<std::mutex> lock(mcp_dev::codec_mutex());
-            codec->EnableInput(false);
-        }
-        mcp_audio::release_output(codec);
-        self.task_exited_ = true;
-            vTaskDelay(portMAX_DELAY);  // WithCaps tasks must not self-delete
+            ESP_LOGE(TAG, "failed to open resampler %lu->%d", in_rate_config, kOpusSampleRate);
+            self.client_fd_ = -1;
+            self.session_++;
             return;
         }
+        resampler_guard.reset(resampler);
     }
 
     // Opus encoder, same profile the cloud agent's audio service encodes
@@ -262,18 +330,9 @@ void MicWsStream::CaptureTask(void* arg) {
         ESP_LOGE(TAG, "failed to open opus encoder");
         self.client_fd_ = -1;
         self.session_++;
-        if (resampler != nullptr) {
-            esp_ae_rate_cvt_close(resampler);
-        }
-        {
-            std::lock_guard<std::mutex> lock(mcp_dev::codec_mutex());
-            codec->EnableInput(false);
-        }
-        mcp_audio::release_output(codec);
-        self.task_exited_ = true;
-        vTaskDelay(portMAX_DELAY);  // WithCaps tasks must not self-delete
         return;
     }
+    std::unique_ptr<void, OpusEncoderDeleter> encoder_guard(encoder);
     int frame_bytes = 0;
     int out_bytes   = 0;
     esp_opus_enc_get_frame_size(encoder, &frame_bytes, &out_bytes);
@@ -383,38 +442,31 @@ void MicWsStream::CaptureTask(void* arg) {
                 // Copy the packet: the queued send outlives this iteration.
                 auto packet = std::make_shared<std::vector<uint8_t>>(enc_buf.begin(),
                                                                      enc_buf.begin() + out.encoded_bytes);
-                auto* job   = new WsSendJob{self.server_, fd, self.session_.load(), packet};
-                if (httpd_queue_work(self.server_, ws_send_job, job) != ESP_OK) {
-                    // Work queue full: client is too slow, drop the frame.
-                    delete job;
-                    if (++queue_full_count >= 10) {
-                        // Persistently stalled: release the stream instead of
-                        // spinning forever against a stuck client.
-                        ESP_LOGW(TAG, "httpd queue kept full, releasing client");
-                        self.ReleaseClient(fd, self.session_.load());
+                httpd_handle_t server = self.server_.load();
+                if (server != nullptr) {
+                    auto* job = new WsSendJob{server, fd, self.session_.load(), packet};
+                    if (httpd_queue_work(server, ws_send_job, job) != ESP_OK) {
+                        // Work queue full: client is too slow, drop the frame.
+                        delete job;
+                        if (++queue_full_count >= 10) {
+                            // Persistently stalled: release the stream instead of
+                            // spinning forever against a stuck client.
+                            ESP_LOGW(TAG, "httpd queue kept full, releasing client");
+                            self.ReleaseClient(fd, self.session_.load());
+                        }
+                    } else {
+                        queue_full_count = 0;
                     }
-                } else {
-                    queue_full_count = 0;
                 }
             }
             pcm.erase(pcm.begin(), pcm.begin() + frame_samples);
         }
     }
 
-    esp_opus_enc_close(encoder);
-    if (resampler != nullptr) {
-        esp_ae_rate_cvt_close(resampler);
-    }
-    {
-        std::lock_guard<std::mutex> lock(mcp_dev::codec_mutex());
-        codec->EnableInput(false);
-    }
-    mcp_audio::release_output(codec);
+    encoder_guard.reset();
+    resampler_guard.reset();
+    codec_guard.release();
     ESP_LOGI(TAG, "capture task stopped");
-    self.task_exited_ = true;
-    // WithCaps tasks must NOT self-delete: park here, the owner deletes us
-    // via vTaskDeleteWithCaps once it sees task_exited_.
-    vTaskDelay(portMAX_DELAY);
 }
 
 bool MicWsStream::Start(httpd_handle_t server, mcp_lan::LanService& service) {
@@ -435,7 +487,10 @@ bool MicWsStream::Start(httpd_handle_t server, mcp_lan::LanService& service) {
     ws_mic.handler                  = WsHandler;
     ws_mic.is_websocket             = true;
     ws_mic.handle_ws_control_frames = false;
-    if (httpd_register_uri_handler(server_, &ws_mic) != ESP_OK) {
+#if CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT
+    ws_mic.ws_pre_handshake_cb = WsPreHandshake;
+#endif
+    if (httpd_register_uri_handler(server, &ws_mic) != ESP_OK) {
         ESP_LOGE(TAG, "failed to register /mic ws handler");
         server_ = nullptr;
         return false;
@@ -495,7 +550,6 @@ void MicWsStream::Stop() {
     }
     session_++;
     client_fd_ = -1;
-    httpd_unregister_uri(server_, "/mic");
     running_ = false;
     // The capture task owns its encoder and codec cleanup. It is reclaimed
     // by EnsureCaptureTask only after task_exited_ becomes true.

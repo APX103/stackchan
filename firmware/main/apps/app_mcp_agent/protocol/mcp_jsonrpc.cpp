@@ -16,6 +16,7 @@
 #include <cJSON.h>
 
 #include "../service/lan_service.h"
+#include "http_guard.h"
 
 static const char* TAG = "McpRpc";
 
@@ -138,19 +139,10 @@ esp_err_t handle_tools_call(LanService& service, httpd_req_t* req, cJSON* id, co
         return send_json(req, make_error_json(id, -32603, "out of memory"));
     }
 
-    httpd_req_t* async_req = nullptr;
-    const esp_err_t begin = httpd_req_async_handler_begin(req, &async_req);
-    if (begin != ESP_OK || async_req == nullptr) {
-        cJSON_Delete(args_copy);
-        cJSON_Delete(id_copy);
-        return send_json(req, make_error_json(id, -32603, "failed to start async request"));
-    }
-
-    service.submit_tool(tool, args_copy, id_copy, async_req);
-    return ESP_OK;
+    return service.submit_tool(tool, args_copy, id_copy, req);
 }
 
-esp_err_t mcp_handler(httpd_req_t* req)
+esp_err_t mcp_handler_impl(httpd_req_t* req)
 {
     auto& service = *static_cast<LanService*>(req->user_ctx);
     if (!service.http_authorized(req)) {
@@ -218,6 +210,11 @@ esp_err_t mcp_handler(httpd_req_t* req)
 
     cJSON_Delete(root);
     return ret;
+}
+
+esp_err_t mcp_handler(httpd_req_t* req)
+{
+    return GuardHttpHandler(req, [req] { return mcp_handler_impl(req); });
 }
 
 }  // namespace

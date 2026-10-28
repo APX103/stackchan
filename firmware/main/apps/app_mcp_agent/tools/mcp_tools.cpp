@@ -212,6 +212,11 @@ ToolOutput tool_set_volume(const cJSON* args)
     if (!get_int(args, "volume", &volume, &err, true, 0, 0, 100)) {
         return err;
     }
+    if (mcp_dev::audio_codec("set volume") == nullptr) {
+        err.is_error = true;
+        err.text = "audio unavailable or insufficient memory; see serial log";
+        return err;
+    }
     {
         std::lock_guard<std::mutex> lock(mcp_dev::codec_mutex());
         GetHAL().setSpeakerVolume((uint8_t)volume);

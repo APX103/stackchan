@@ -52,11 +52,10 @@ public:
         return instance;
     }
 
-    // Registers the /speaker WebSocket handler on `server` and spawns the
-    // playback task (idle until a client claims the stream).
+    // Registers /speaker; the playback task is created on the first client start.
     bool Start(httpd_handle_t server, mcp_lan::LanService& service);
 
-    // Unregisters the handler, disconnects the client and stops playback.
+    // Disconnects the client and stops playback before HTTPD is stopped.
     void Stop();
 
     static bool Stopped()
@@ -85,13 +84,16 @@ private:
     SpeakerWsStream(const SpeakerWsStream&) = delete;
     SpeakerWsStream& operator=(const SpeakerWsStream&) = delete;
 
+    static esp_err_t WsPreHandshake(httpd_req_t* req);
     static esp_err_t WsHandler(httpd_req_t* req);
+    static esp_err_t WsHandlerImpl(httpd_req_t* req);
     static void PlaybackTask(void* arg);
+    static void PlaybackTaskImpl(void* arg);
     // Creates the playback task on the first client "start" (lazy: the
     // stack is only held while somebody streams). False when out of memory.
     bool EnsurePlaybackTask();
 
-    httpd_handle_t server_ = nullptr;
+    std::atomic<httpd_handle_t> server_{nullptr};
     mcp_lan::LanService* mcp_service_ = nullptr;
     TaskHandle_t playback_task_ = nullptr;
     std::atomic<bool> running_{false};

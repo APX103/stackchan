@@ -84,3 +84,4 @@ CONFIG_LV_BUILD_DEMOS=n
 
 # WebSocket support in esp_http_server (needed by the MCP Agent audio streams)
 CONFIG_HTTPD_WS_SUPPORT=y
+CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT=y

@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <exception>
 #include <memory>
 #include <vector>
 
@@ -652,15 +653,45 @@ void AppAudioTest::run_spectrum_mode()
 void AppAudioTest::audio_task(void* arg)
 {
     auto* self = static_cast<AppAudioTest*>(arg);
-    while (self->_task_running.load()) {
-        const int mode = self->_task_mode.load();
-        if (mode == (int)TaskMode::Spectrum) {
-            self->run_spectrum_mode();
-        } else if (mode == (int)TaskMode::Tones) {
-            self->run_tones_mode();
-        } else {
-            vTaskDelay(pdMS_TO_TICKS(50));
+    try {
+        while (self->_task_running.load()) {
+            const int mode = self->_task_mode.load();
+            if (mode == (int)TaskMode::Spectrum) {
+                self->run_spectrum_mode();
+            } else if (mode == (int)TaskMode::Tones) {
+                self->run_tones_mode();
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(50));
+            }
         }
+    } catch (const std::exception& e) {
+        ESP_LOGE(TAG, "audio task aborted: %s", e.what());
+        auto* codec = audio_test::codec();
+        if (codec != nullptr) {
+            std::lock_guard<std::mutex> lock(audio_test::codec_mutex());
+            codec->EnableInput(false);
+            codec->EnableOutput(false);
+        }
+        if (self->_volume_saved) {
+            GetHAL().setSpeakerVolume(self->_saved_volume);
+            self->_volume_saved = false;
+        }
+        self->_task_mode.store((int)TaskMode::Idle);
+        self->_tones_done.store(true);
+    } catch (...) {
+        ESP_LOGE(TAG, "audio task aborted: unknown exception");
+        auto* codec = audio_test::codec();
+        if (codec != nullptr) {
+            std::lock_guard<std::mutex> lock(audio_test::codec_mutex());
+            codec->EnableInput(false);
+            codec->EnableOutput(false);
+        }
+        if (self->_volume_saved) {
+            GetHAL().setSpeakerVolume(self->_saved_volume);
+            self->_volume_saved = false;
+        }
+        self->_task_mode.store((int)TaskMode::Idle);
+        self->_tones_done.store(true);
     }
     self->_task_exited.store(true);
     // WithCaps tasks must not self-delete: park, the owner frees us.

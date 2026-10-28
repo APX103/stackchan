@@ -42,11 +42,10 @@ public:
         return instance;
     }
 
-    // Registers the /mic WebSocket handler on `server` and spawns the
-    // capture task (idle until a client claims the stream).
+    // Registers /mic; the capture task is created on the first client start.
     bool Start(httpd_handle_t server, mcp_lan::LanService& service);
 
-    // Unregisters the handler, disconnects the client and stops capturing.
+    // Disconnects the client and stops capturing before HTTPD is stopped.
     void Stop();
 
     // A stopped service is not reusable until its capture task has released
@@ -90,13 +89,16 @@ private:
     MicWsStream(const MicWsStream&) = delete;
     MicWsStream& operator=(const MicWsStream&) = delete;
 
+    static esp_err_t WsPreHandshake(httpd_req_t* req);
     static esp_err_t WsHandler(httpd_req_t* req);
+    static esp_err_t WsHandlerImpl(httpd_req_t* req);
     static void CaptureTask(void* arg);
+    static void CaptureTaskImpl(void* arg);
     // Creates the capture task on the first client "start" (lazy: the stack
     // is only held while somebody streams). False when out of memory.
     bool EnsureCaptureTask();
 
-    httpd_handle_t server_ = nullptr;
+    std::atomic<httpd_handle_t> server_{nullptr};
     mcp_lan::LanService* mcp_service_ = nullptr;
     TaskHandle_t capture_task_ = nullptr;
     std::atomic<bool> running_{false};

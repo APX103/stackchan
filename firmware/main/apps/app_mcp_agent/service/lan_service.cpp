@@ -22,6 +22,7 @@
 #include "../audio/speaker_ws_stream.h"
 #include "../platform/device_access.h"
 #include "../protocol/mcp_jsonrpc.h"
+#include "../protocol/http_guard.h"
 #include "../tools/mcp_photo.h"
 
 static const char* TAG = "McpSvc";
@@ -41,6 +42,7 @@ struct LanService::AsyncToolJob {
     httpd_req_t* req = nullptr;
     ToolOutput result;
     int64_t deadline_us = 0;
+    bool ready = false;
     std::atomic<bool> response_done{false};
 
     ~AsyncToolJob()
@@ -64,7 +66,7 @@ esp_err_t send_json(httpd_req_t* req, const std::string& body, const char* statu
     return httpd_resp_send(req, body.c_str(), (ssize_t)body.size());
 }
 
-esp_err_t status_handler(httpd_req_t* req)
+esp_err_t status_handler_impl(httpd_req_t* req)
 {
     auto& service = *static_cast<LanService*>(req->user_ctx);
     const auto st = service.status();
@@ -102,7 +104,7 @@ esp_err_t status_handler(httpd_req_t* req)
     return ret;
 }
 
-esp_err_t photo_handler(httpd_req_t* req)
+esp_err_t photo_handler_impl(httpd_req_t* req)
 {
     auto& service = *static_cast<LanService*>(req->user_ctx);
     if (!service.http_authorized(req)) {
@@ -121,6 +123,16 @@ esp_err_t photo_handler(httpd_req_t* req)
     return httpd_resp_send(req, (const char*)snapshot.bytes->data(), (ssize_t)snapshot.bytes->size());
 }
 
+esp_err_t status_handler(httpd_req_t* req)
+{
+    return GuardHttpHandler(req, [req] { return status_handler_impl(req); });
+}
+
+esp_err_t photo_handler(httpd_req_t* req)
+{
+    return GuardHttpHandler(req, [req] { return photo_handler_impl(req); });
+}
+
 }  // namespace
 
 LanService::LanService() = default;
@@ -136,12 +148,60 @@ LanService::~LanService()
 
 void LanService::executor_entry(void* arg)
 {
-    static_cast<LanService*>(arg)->executor_loop();
+    auto* self = static_cast<LanService*>(arg);
+    try {
+        self->executor_loop();
+    } catch (const std::exception& e) {
+        ESP_LOGE(TAG, "executor aborted: %s", e.what());
+    } catch (...) {
+        ESP_LOGE(TAG, "executor aborted: unknown exception");
+    }
+
+    self->running_.store(false);
+    {
+        std::unique_lock<std::mutex> lock(self->executor_.mtx);
+        self->executor_.closing = true;
+        self->executor_.cv.wait(lock, [self] { return self->executor_.beginning == 0; });
+    }
+    std::map<uint64_t, JobPtr> jobs;
+    {
+        std::lock_guard<std::mutex> lock(self->executor_.mtx);
+        jobs.swap(self->executor_.active);
+        self->executor_.queue.clear();
+    }
+    for (auto& [id, job] : jobs) {
+        if (job->req != nullptr) {
+            httpd_req_async_handler_complete(job->req);
+            job->req = nullptr;
+        }
+    }
+    jobs.clear();
+    self->stop_httpd_and_streams();
+    self->executor_.exited.store(true);
+    vTaskDelay(portMAX_DELAY);
 }
 
 void LanService::watchdog_entry(void* arg)
 {
-    static_cast<LanService*>(arg)->check_timeouts();
+    auto* self = static_cast<LanService*>(arg);
+    while (true) {
+        {
+            std::lock_guard<std::mutex> lock(self->executor_.mtx);
+            if (self->executor_.closing) {
+                break;
+            }
+        }
+        try {
+            self->check_timeouts();
+        } catch (const std::exception& e) {
+            ESP_LOGE(TAG, "timeout check aborted: %s", e.what());
+        } catch (...) {
+            ESP_LOGE(TAG, "timeout check aborted: unknown exception");
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    self->executor_.timeout_exited.store(true);
+    vTaskDelay(portMAX_DELAY);
 }
 
 bool LanService::start(std::string* err)
@@ -166,6 +226,7 @@ bool LanService::start(std::string* err)
         executor_.started = true;
         executor_.queue.clear();
         executor_.active.clear();
+        executor_.beginning = 0;
         next_job_id_ = 1;
     }
     executor_.exited.store(false);
@@ -179,6 +240,16 @@ bool LanService::start(std::string* err)
         executor_.exited.store(true);
         mark_start_failure("failed to create mcp_tool task");
         if (err != nullptr) *err = "failed to create mcp_tool task";
+        return false;
+    }
+
+    executor_.timeout_exited.store(false);
+    if (xTaskCreatePinnedToCoreWithCaps(watchdog_entry, "mcp_timeout", 4096, this, 3,
+                                        &executor_.timeout_task, 1, MALLOC_CAP_INTERNAL) != pdPASS) {
+        executor_.timeout_task = nullptr;
+        executor_.timeout_exited.store(true);
+        mark_start_failure("failed to create mcp_timeout task");
+        if (err != nullptr) *err = "failed to create mcp_timeout task";
         return false;
     }
 
@@ -204,20 +275,6 @@ bool LanService::start(std::string* err)
         return false;
     }
     httpd_.store(server);
-
-    const esp_timer_create_args_t timer_args = {
-        .callback = watchdog_entry,
-        .arg = this,
-        .dispatch_method = ESP_TIMER_TASK,
-        .name = "mcp_timeout",
-        .skip_unhandled_events = true,
-    };
-    if (esp_timer_create(&timer_args, &watchdog_) != ESP_OK ||
-        esp_timer_start_periodic(watchdog_, 50000) != ESP_OK) {
-        mark_start_failure("failed to create timeout watchdog");
-        if (err != nullptr) *err = "failed to create timeout watchdog";
-        return false;
-    }
 
     httpd_uri_t status_uri = {};
     status_uri.uri = "/";
@@ -270,7 +327,7 @@ void LanService::request_stop()
 bool LanService::stopped() const
 {
     return !running_.load() && httpd_.load() == nullptr && executor_.exited.load() &&
-           MicWsStream::Stopped() && SpeakerWsStream::Stopped();
+           executor_.timeout_exited.load() && MicWsStream::Stopped() && SpeakerWsStream::Stopped();
 }
 
 void LanService::reclaim()
@@ -282,10 +339,9 @@ void LanService::reclaim()
         vTaskDeleteWithCaps(executor_.task);
         executor_.task = nullptr;
     }
-    if (watchdog_ != nullptr) {
-        esp_timer_stop(watchdog_);
-        esp_timer_delete(watchdog_);
-        watchdog_ = nullptr;
+    if (executor_.timeout_task != nullptr) {
+        vTaskDeleteWithCaps(executor_.timeout_task);
+        executor_.timeout_task = nullptr;
     }
     MicWsStream::Reclaim();
     SpeakerWsStream::Reclaim();
@@ -296,36 +352,84 @@ void LanService::reclaim()
     executor_.active.clear();
 }
 
-void LanService::submit_tool(const Tool* tool, cJSON* args, cJSON* id, httpd_req_t* async_req)
+esp_err_t LanService::submit_tool(const Tool* tool, cJSON* args, cJSON* id, httpd_req_t* req)
 {
-    auto job = std::make_shared<AsyncToolJob>();
+    JobPtr job;
+    try {
+        job = std::make_shared<AsyncToolJob>();
+    } catch (...) {
+        cJSON_Delete(args);
+        cJSON_Delete(id);
+        throw;
+    }
     job->tool = tool;
     job->args = args;
     job->id = id;
-    job->req = async_req;
     job->deadline_us = esp_timer_get_time() + kToolTimeoutUs;
 
     uint64_t job_id = 0;
-    bool accepted = false;
     FinishKind immediate = FinishKind::StartFailure;
     {
         std::lock_guard<std::mutex> lock(executor_.mtx);
-        job_id = next_job_id_++;
-        executor_.active.emplace(job_id, job);
-        if (!running_.load() || executor_.closing || !executor_.started) {
-            immediate = FinishKind::StartFailure;
+        if (running_.load() && !executor_.closing && executor_.started &&
+            executor_.queue.size() < kMaxQueuedTools) {
+            job_id = next_job_id_++;
+            try {
+                executor_.active.emplace(job_id, job);
+                executor_.queue.push_back(job_id);
+                ++executor_.beginning;
+            } catch (...) {
+                executor_.active.erase(job_id);
+                job_id = 0;
+                throw;
+            }
         } else if (executor_.queue.size() >= kMaxQueuedTools) {
             immediate = FinishKind::QueueFull;
-        } else {
-            executor_.queue.push_back(job_id);
-            accepted = true;
         }
     }
-    if (!accepted) {
-        finish_job(job_id, immediate);
-        return;
+    if (job_id == 0) {
+        const bool queue_full = immediate == FinishKind::QueueFull;
+        return send_json(req,
+                         make_error_json(id, -32603,
+                                         queue_full ? "tool queue is full" : "tool executor is unavailable"),
+                         "503 Service Unavailable");
     }
-    executor_.cv.notify_one();
+
+    struct BeginCompletion {
+        LanService* service;
+        ~BeginCompletion()
+        {
+            {
+                std::lock_guard<std::mutex> lock(service->executor_.mtx);
+                --service->executor_.beginning;
+            }
+            service->executor_.cv.notify_all();
+        }
+    } begin_completion{this};
+
+    httpd_req_t* async_req = nullptr;
+    const esp_err_t begin = httpd_req_async_handler_begin(req, &async_req);
+    if (begin != ESP_OK || async_req == nullptr) {
+        {
+            std::lock_guard<std::mutex> lock(executor_.mtx);
+            executor_.active.erase(job_id);
+            for (auto it = executor_.queue.begin(); it != executor_.queue.end(); ++it) {
+                if (*it == job_id) {
+                    executor_.queue.erase(it);
+                    break;
+                }
+            }
+        }
+        return send_json(req, make_error_json(id, -32603, "failed to start async request"),
+                         "500 Internal Server Error");
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(executor_.mtx);
+        job->req = async_req;
+        job->ready = true;
+    }
+    return ESP_OK;
 }
 
 void LanService::finish_job(uint64_t id, FinishKind kind)
@@ -343,7 +447,23 @@ void LanService::finish_job(uint64_t id, FinishKind kind)
             return;
         }
     }
-    finish_request(job, kind);
+    try {
+        finish_request(job, kind);
+    } catch (const std::bad_alloc&) {
+        ESP_LOGE(TAG, "tool response aborted: out of memory");
+        if (job->req != nullptr) {
+            SendHandlerError(job->req, true);
+            httpd_req_async_handler_complete(job->req);
+            job->req = nullptr;
+        }
+    } catch (...) {
+        ESP_LOGE(TAG, "tool response aborted: unknown exception");
+        if (job->req != nullptr) {
+            SendHandlerError(job->req, false);
+            httpd_req_async_handler_complete(job->req);
+            job->req = nullptr;
+        }
+    }
 }
 
 void LanService::finish_request(const JobPtr& job, FinishKind kind)
@@ -389,7 +509,7 @@ void LanService::check_timeouts()
     {
         std::lock_guard<std::mutex> lock(executor_.mtx);
         for (const auto& [id, job] : executor_.active) {
-            if (!job->response_done.load() && now >= job->deadline_us) {
+            if (job->ready && !job->response_done.load() && now >= job->deadline_us) {
                 expired.push_back(id);
             }
         }
@@ -414,18 +534,28 @@ void LanService::cancel_queued_jobs()
 
 void LanService::stop_httpd_and_streams()
 {
+    {
+        std::unique_lock<std::mutex> lock(executor_.mtx);
+        executor_.cv.wait(lock, [this] { return executor_.beginning == 0; });
+    }
+    while (!executor_.timeout_exited.load()) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
     MicWsStream::GetInstance().Stop();
     SpeakerWsStream::GetInstance().Stop();
+    uint32_t wait_ms = 0;
+    while (!MicWsStream::Stopped() || !SpeakerWsStream::Stopped()) {
+        if (wait_ms % 1000 == 0) {
+            ESP_LOGW(TAG, "waiting for audio tasks to exit before stopping HTTPD");
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+        wait_ms += 10;
+    }
     httpd_handle_t server = httpd_.exchange(nullptr);
     if (server != nullptr) {
         httpd_stop(server);
     }
     mcp_photo::clear();
-    if (watchdog_ != nullptr) {
-        esp_timer_stop(watchdog_);
-        esp_timer_delete(watchdog_);
-        watchdog_ = nullptr;
-    }
 }
 
 void LanService::executor_loop()
@@ -435,19 +565,25 @@ void LanService::executor_loop()
         JobPtr job;
         {
             std::unique_lock<std::mutex> lock(executor_.mtx);
-            executor_.cv.wait_for(lock, std::chrono::seconds(1),
-                                  [this] { return executor_.closing || !executor_.queue.empty(); });
+            executor_.cv.wait_for(lock, std::chrono::seconds(1), [this] {
+                if (executor_.closing) return true;
+                for (const uint64_t queued : executor_.queue) {
+                    const auto it = executor_.active.find(queued);
+                    if (it != executor_.active.end() && it->second->ready) return true;
+                }
+                return false;
+            });
             if (executor_.closing) {
                 break;
             }
-            if (executor_.queue.empty()) {
-                continue;
-            }
-            id = executor_.queue.front();
-            executor_.queue.pop_front();
-            auto it = executor_.active.find(id);
-            if (it != executor_.active.end()) {
-                job = it->second;
+            for (auto queued = executor_.queue.begin(); queued != executor_.queue.end(); ++queued) {
+                auto it = executor_.active.find(*queued);
+                if (it != executor_.active.end() && it->second->ready) {
+                    id = *queued;
+                    job = it->second;
+                    executor_.queue.erase(queued);
+                    break;
+                }
             }
         }
 
@@ -455,9 +591,15 @@ void LanService::executor_loop()
             std::string error;
             registry_.call(job->tool->name, job->args, &job->result, &error);
         }
-        finish_job(id, FinishKind::Success);
+        if (id != 0) {
+            finish_job(id, FinishKind::Success);
+        }
     }
 
+    {
+        std::unique_lock<std::mutex> lock(executor_.mtx);
+        executor_.cv.wait(lock, [this] { return executor_.beginning == 0; });
+    }
     cancel_queued_jobs();
     stop_httpd_and_streams();
     {
@@ -615,21 +757,53 @@ bool LanService::http_authorized(httpd_req_t* req)
     return diff == 0;
 }
 
+static int hex_value(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static bool decoded_token_matches(const char* value, size_t value_len, const char* expected)
+{
+    const size_t expected_len = strlen(expected);
+    volatile unsigned char diff = 0;
+    size_t decoded_len = 0;
+    for (size_t i = 0; i < value_len; ++i) {
+        char decoded = value[i];
+        if (decoded == '%') {
+            if (i + 2 >= value_len) return false;
+            const int high = hex_value(value[i + 1]);
+            const int low = hex_value(value[i + 2]);
+            if (high < 0 || low < 0) return false;
+            decoded = (char)((high << 4) | low);
+            i += 2;
+        } else if (decoded == '+') {
+            decoded = ' ';
+        }
+        if (decoded_len >= expected_len) {
+            diff = 1;
+        } else {
+            diff |= (unsigned char)(decoded ^ expected[decoded_len]);
+        }
+        ++decoded_len;
+    }
+    return decoded_len == expected_len && diff == 0;
+}
+
 bool LanService::ws_authorized(httpd_req_t* req)
 {
     if (strlen(CONFIG_MCP_AGENT_TOKEN) == 0) {
         return true;
     }
-    const char* expected = CONFIG_MCP_AGENT_TOKEN;
-    const size_t expected_len = strlen(expected);
     const char* query = strchr(req->uri, '?');
     while (query != nullptr) {
         const char* part = query + 1;
         const char* end = strchr(part, '&');
         const size_t part_len = end != nullptr ? (size_t)(end - part) : strlen(part);
         if (part_len >= 6 && strncmp(part, "token=", 6) == 0) {
-            const size_t value_len = part_len - 6;
-            return value_len == expected_len && strncmp(part + 6, expected, value_len) == 0;
+            return decoded_token_matches(part + 6, part_len - 6, CONFIG_MCP_AGENT_TOKEN);
         }
         query = end;
     }

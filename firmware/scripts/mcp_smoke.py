@@ -128,7 +128,10 @@ def main():
     text = r["result"]["content"][0]["text"]
     check("take_photo", "/photo.jpg" in text, text[:100])
     photo_url = json.loads(text)["url"].replace("https://", "http://")
-    with urllib.request.urlopen(photo_url, timeout=10) as resp:
+    photo_req = urllib.request.Request(photo_url)
+    if TOKEN:
+        photo_req.add_header("Authorization", "Bearer " + TOKEN)
+    with urllib.request.urlopen(photo_req, timeout=10) as resp:
         data = resp.read()
     check("GET /photo.jpg", resp_ok(data) and data[:2] == b"\xff\xd8", f"{len(data)} bytes")
 

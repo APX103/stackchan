@@ -5,19 +5,18 @@
  */
 #include "audio_test_audio.h"
 
-#include <board.h>
+#include "apps/common/audio/codec_access.h"
 
 namespace audio_test {
 
 AudioCodec* codec()
 {
-    return Board::GetInstance().GetAudioCodec();
+    return common_audio::codec("audio test");
 }
 
 std::mutex& codec_mutex()
 {
-    static std::mutex mutex;
-    return mutex;
+    return common_audio::codec_mutex();
 }
 
 }  // namespace audio_test

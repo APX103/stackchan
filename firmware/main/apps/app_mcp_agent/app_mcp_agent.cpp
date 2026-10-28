@@ -70,7 +70,7 @@ void AppMcpAgent::onCreate()
 void AppMcpAgent::onOpen()
 {
     if (_closing) {
-        if (!_service->stopped()) {
+        if (_service && !_service->stopped()) {
             return;  // previous close is still stopping; do not reinitialize
         }
         onClose();
@@ -173,8 +173,10 @@ void AppMcpAgent::onOpen()
 void AppMcpAgent::onRunning()
 {
     if (_closing) {
-        if (_service->stopped()) {
-            _service->reclaim();
+        if (!_service || _service->stopped()) {
+            if (_service) {
+                _service->reclaim();
+            }
             close();
         }
         return;
@@ -217,12 +219,12 @@ void AppMcpAgent::onSleeping()
     }
 }
 
-// onClose() runs only after the service's asynchronous stop has completed.
-// It performs bounded UI cleanup; no HTTPD or worker waits are allowed here.
+// UI and service cleanup runs only after the asynchronous stop has completed.
+// No HTTPD or worker waits are allowed here.
 void AppMcpAgent::onClose()
 {
-    if (!_closing) {
-        _closing = true;
+    _closing = true;
+    if (_service) {
         _service->request_stop();
         if (!_service->stopped()) {
             return;  // Mooncake close must not destroy live UI/service state
