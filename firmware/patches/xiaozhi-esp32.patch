@@ -1,5 +1,5 @@
 diff --git a/main/application.cc b/main/application.cc
-index d69d43d..e67514b 100644
+index d69d43d..bf15171 100644
 --- a/main/application.cc
 +++ b/main/application.cc
 @@ -1,14 +1,15 @@
@@ -24,7 +24,32 @@ index d69d43d..e67514b 100644
  
  #include <cstring>
  #include <esp_log.h>
-@@ -399,6 +400,7 @@ void Application::CheckNewVersion() {
+@@ -249,11 +250,23 @@ void Application::Run() {
+             clock_ticks_++;
+             auto display = Board::GetInstance().GetDisplay();
+             display->UpdateStatusBar();
+-        
++
+             // Print debug info every 10 seconds
+             if (clock_ticks_ % 10 == 0) {
+                 SystemInfo::PrintHeapStats();
+             }
++
++            // STACKCHAN-FIX(vc-pipeline): drain-trigger safety net. The send
++            // queue is normally drained on the on_send_queue_available
++            // callback, which only fires when a packet is pushed while the
++            // queue is below its limit. If SendAudio fails once (e.g. the UDP
++            // handle is momentarily gone) and the queue fills up, that
++            // callback never fires again and voice uplink freezes until the
++            // next wake word. Re-arm the drain event every second while the
++            // queue is non-empty.
++            if (!audio_service_.IsSendQueueEmpty()) {
++                xEventGroupSetBits(event_group_, MAIN_EVENT_SEND_AUDIO);
++            }
+         }
+     }
+ }
+@@ -399,6 +412,7 @@ void Application::CheckNewVersion() {
      const int MAX_RETRY = 10;
      int retry_count = 0;
      int retry_delay = 10; // Initial retry delay in seconds
@@ -32,7 +57,7 @@ index d69d43d..e67514b 100644
  
      auto& board = Board::GetInstance();
      while (true) {
-@@ -441,15 +443,18 @@ void Application::CheckNewVersion() {
+@@ -441,15 +455,18 @@ void Application::CheckNewVersion() {
  
          // No new version, mark the current version as valid
          ota_->MarkCurrentVersionValid();
@@ -55,7 +80,7 @@ index d69d43d..e67514b 100644
          }
  
          // This will block the loop until the activation is done or timeout
-@@ -609,36 +614,6 @@ void Application::InitializeProtocol() {
+@@ -609,36 +626,6 @@ void Application::InitializeProtocol() {
      protocol_->Start();
  }
  
@@ -92,7 +117,7 @@ index d69d43d..e67514b 100644
  void Application::Alert(const char* status, const char* message, const char* emotion, const std::string_view& sound) {
      ESP_LOGW(TAG, "Alert [%s] %s: %s", emotion, status, message);
      auto display = Board::GetInstance().GetDisplay();
-@@ -716,8 +691,13 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
+@@ -716,8 +703,13 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
          return;
      }
  
@@ -106,7 +131,21 @@ index d69d43d..e67514b 100644
              return;
          }
      }
-@@ -825,8 +805,13 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
+@@ -783,7 +775,13 @@ void Application::HandleWakeWordDetectedEvent() {
+     ESP_LOGI(TAG, "Wake word detected: %s (state: %d)", wake_word.c_str(), (int)state);
+ 
+     if (state == kDeviceStateIdle) {
++#if CONFIG_SEND_WAKE_WORD_DATA
++        // STACKCHAN-FIX(vc-pipeline): only encode the wake-word audio when it
++        // is actually sent. Without this config the encoded packets are pushed
++        // into a deque that nothing ever drains, permanently retaining 5-7 KB
++        // of internal SRAM.
+         audio_service_.EncodeWakeWord();
++#endif
+         auto wake_word = audio_service_.GetLastWakeWord();
+ 
+         if (!protocol_->IsAudioChannelOpened()) {
+@@ -825,8 +823,13 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
          return;
      }
  
@@ -120,7 +159,18 @@ index d69d43d..e67514b 100644
              audio_service_.EnableWakeWordDetection(true);
              return;
          }
-@@ -1116,4 +1101,3 @@ void Application::ResetProtocol() {
+@@ -1024,7 +1027,10 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
+     auto state = GetDeviceState();
+     
+     if (state == kDeviceStateIdle) {
++#if CONFIG_SEND_WAKE_WORD_DATA
++        // STACKCHAN-FIX(vc-pipeline): see HandleWakeWordDetectedEvent
+         audio_service_.EncodeWakeWord();
++#endif
+ 
+         if (!protocol_->IsAudioChannelOpened()) {
+             SetDeviceState(kDeviceStateConnecting);
+@@ -1116,4 +1122,3 @@ void Application::ResetProtocol() {
          protocol_.reset();
      });
  }
@@ -316,6 +366,82 @@ index 3692e0c..7bfbc5c 100644
      
      // Strategy instance
      std::unique_ptr<AssetStrategy> strategy_;
+diff --git a/main/audio/audio_service.cc b/main/audio/audio_service.cc
+index 350ac58..83b73b8 100644
+--- a/main/audio/audio_service.cc
++++ b/main/audio/audio_service.cc
+@@ -528,6 +528,11 @@ std::unique_ptr<AudioStreamPacket> AudioService::PopPacketFromSendQueue() {
+     return packet;
+ }
+ 
++bool AudioService::IsSendQueueEmpty() {
++    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
++    return audio_send_queue_.empty();
++}
++
+ void AudioService::EncodeWakeWord() {
+     if (wake_word_) {
+         wake_word_->EncodeWakeWordData();
+@@ -560,6 +565,22 @@ void AudioService::EnableWakeWordDetection(bool enable) {
+             }
+             wake_word_initialized_ = true;
+         }
++        // STACKCHAN-FIX(vc-pipeline): create the voice-processing AFE now, at
++        // first idle, instead of lazily on the first listening transition.
++        // The lazy path allocates this processor (incl. its 4 KB
++        // audio_communication task stack) when free internal SRAM can already
++        // be below that; the xTaskCreate result was historically ignored and
++        // with no fetch consumer the AFE feed ring buffer overflows — the
++        // server then never receives any audio. The task parks on the
++        // PROCESSOR_RUNNING bit until the first listening state, so creating
++        // it early costs nothing at runtime.
++#if CONFIG_USE_AUDIO_PROCESSOR
++        if (!audio_processor_initialized_) {
++            audio_processor_->Initialize(codec_, OPUS_FRAME_DURATION_MS, models_list_);
++            audio_processor_initialized_ = true;
++            ESP_LOGI(TAG, "voice processing pipeline pre-initialized");
++        }
++#endif
+         // Reset input resampler to clear cached data from previous mode (e.g. AudioProcessor)
+         // This prevents buffer overflow when switching between different feed sizes
+         {
+diff --git a/main/audio/audio_service.h b/main/audio/audio_service.h
+index 99db546..533e806 100644
+--- a/main/audio/audio_service.h
++++ b/main/audio/audio_service.h
+@@ -129,6 +129,8 @@ public:
+ 
+     bool PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait = false);
+     std::unique_ptr<AudioStreamPacket> PopPacketFromSendQueue();
++    // STACKCHAN-FIX(vc-pipeline): used by the 1 Hz send-queue drain trigger
++    bool IsSendQueueEmpty();
+     void PlaySound(const std::string_view& sound);
+     bool ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples);
+     void ResetDecoder();
+diff --git a/main/audio/processors/afe_audio_processor.cc b/main/audio/processors/afe_audio_processor.cc
+index 15e9cc5..f25be48 100644
+--- a/main/audio/processors/afe_audio_processor.cc
++++ b/main/audio/processors/afe_audio_processor.cc
+@@ -67,11 +67,17 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
+     afe_iface_ = esp_afe_handle_from_config(afe_config);
+     afe_data_ = afe_iface_->create_from_config(afe_config);
+     
+-    xTaskCreate([](void* arg) {
++    // STACKCHAN-FIX(vc-pipeline): surface task-creation failure instead of
++    // silently running a pipeline with no fetch consumer (the AFE feed ring
++    // buffer then overflows and no audio ever reaches the server).
++    if (xTaskCreate([](void* arg) {
+         auto this_ = (AfeAudioProcessor*)arg;
+         this_->AudioProcessorTask();
+         vTaskDelete(NULL);
+-    }, "audio_communication", 4096, this, 3, NULL);
++    }, "audio_communication", 4096, this, 3, NULL) != pdPASS) {
++        ESP_LOGE(TAG, "failed to create audio_communication task (no memory); "
++                 "voice uplink will not work until reboot");
++    }
+ }
+ 
+ AfeAudioProcessor::~AfeAudioProcessor() {
 diff --git a/main/boards/common/i2c_device.cc b/main/boards/common/i2c_device.cc
 index 835997d..ea50d51 100644
 --- a/main/boards/common/i2c_device.cc

@@ -11,6 +11,53 @@ config STACKCHAN_SERVER_URL
 
 endmenu
 
+menu "MCP Agent"
+
+config MCP_AGENT_ENABLE
+    bool "Enable the MCP Agent app (LAN MCP server)"
+    default y
+    help
+        Installs the MCP.AGENT launcher app: a self-contained MCP server
+        (Streamable HTTP + WebSocket audio streams) served on the LAN while
+        the app is open. Does not touch the official cloud agent.
+
+config MCP_AGENT_PORT
+    int "MCP Agent HTTP server port"
+    default 8080
+    range 1024 65535
+    help
+        Port of the MCP Agent's httpd instance (POST /mcp, GET /,
+        GET /photo.jpg, WS /mic, WS /speaker).
+
+config MCP_AGENT_TOKEN
+    string "MCP Agent bearer token (empty = no auth)"
+    default ""
+    help
+        When non-empty, /mcp and /photo.jpg require
+        "Authorization: Bearer <token>"; the WebSocket endpoints require
+        "?token=<token>" on the query string. Traffic is still plain HTTP
+        (LAN threat model).
+
+config MCP_AGENT_ENABLE_OWNER_TOOLS
+    bool "Expose owner-only tools (self.reboot) over LAN"
+    default n
+    help
+        Disabled by default: an unauthenticated LAN client must not be able
+        to reboot the device.
+
+endmenu
+
+menu "Audio Test"
+
+config AUDIO_TEST_ENABLE
+    bool "Enable the standalone AUDIO.TEST app"
+    default n
+    help
+        Installs AUDIO.TEST independently of MCP Agent. Its audio task and
+        FFT resources are created only while the app is in use.
+
+endmenu
+
 menu "Xiaozhi Assistant"
 
 config OTA_URL
