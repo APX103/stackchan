@@ -137,11 +137,9 @@ void AppCameraTest::onRunning()
     {
         LvglLockGuard lock;
         lv_obj_invalidate((lv_obj_t*)_img);
-        ++_frames;
         ++_fps_count;
         if (t - _fps_tick_ms >= 1000) {
-            lv_label_set_text_fmt((lv_obj_t*)_fps_label, "%" PRIu32 " fps (frames %" PRIu32 ")",
-                                  _fps_count, _frames);
+            lv_label_set_text_fmt((lv_obj_t*)_fps_label, "%" PRIu32 " fps", _fps_count);
             _fps_count  = 0;
             _fps_tick_ms = t;
         }
@@ -150,7 +148,7 @@ void AppCameraTest::onRunning()
 
 void AppCameraTest::onClose()
 {
-    mclog::tagInfo(getAppInfo().name, "on close, %" PRIu32 " frames shown", _frames);
+    mclog::tagInfo(getAppInfo().name, "on close");
     hal_bridge::set_power_save_user_disabled(false);
 
     {
@@ -168,5 +166,4 @@ void AppCameraTest::onClose()
         _img_dsc = nullptr;
     }
     _img = _fps_label = nullptr;
-    _frames           = 0;
 }
