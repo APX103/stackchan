@@ -44,11 +44,12 @@ extern "C" void app_main(void)
         //                              GetMooncake().installApp(std::make_unique<AppAppCenter>()));
         // hal_toggles::register_app_id(hal_toggles::App::Ezdata, GetMooncake().installApp(std::make_unique<AppEzdata>()));
         // hal_toggles::register_app_id(hal_toggles::App::Dance, GetMooncake().installApp(std::make_unique<AppDance>()));
-        GetMooncake().installApp(std::make_unique<AppSetup>());
         // SEP-0005: LAN MCP server app
         GetMooncake().installApp(std::make_unique<AppMcpAgent>());
         // SEP-0008: camera preview app
         GetMooncake().installApp(std::make_unique<AppCameraTest>());
+        // SETUP 按用户要求放最后一位
+        GetMooncake().installApp(std::make_unique<AppSetup>());
 
         // SEP-0002: automation console + http api (launch app by name)
         sep::init();

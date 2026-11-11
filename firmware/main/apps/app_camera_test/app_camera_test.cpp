@@ -80,13 +80,15 @@ void AppCameraTest::onOpen()
 
     {
         LvglLockGuard lock;
-        view::create_home_indicator([this]() { GetMooncake().closeApp(getID()); },
-                                    0x39C5BB, 0x062A28);
-        view::create_status_bar(0x39C5BB, 0x062A28);
-
+        // 先建取景画面,再建 indicator/status bar —— LVGL 后建者在上层,
+        // 否则全屏画面会把返回条盖住(回不了 Launcher 的 bug)
         _img = lv_image_create(lv_screen_active());
         lv_obj_center((lv_obj_t*)_img);
         lv_obj_set_style_bg_color(lv_screen_active(), lv_color_hex(0x000000), 0);
+
+        view::create_home_indicator([this]() { GetMooncake().closeApp(getID()); },
+                                    0x39C5BB, 0x062A28);
+        view::create_status_bar(0x39C5BB, 0x062A28);
 
         _fps_label = lv_label_create(lv_screen_active());
         lv_label_set_text((lv_obj_t*)_fps_label, camera ? "..." : "camera unavailable");
@@ -120,7 +122,7 @@ void AppCameraTest::onRunning()
     const uint32_t t = now_ms();
     // Defensive: re-assert keep-awake every 30 s (idempotent) in case any
     // unknown path re-enables the power save timer while we run.
-    if (t - _reassert_ms >= 30000) {
+    if (t - _reassert_ms >= 10000) {
         _reassert_ms = t;
         hal_bridge::set_power_save_user_disabled(true);
     }
