@@ -86,3 +86,4 @@ CONFIG_LV_BUILD_DEMOS=n
 
 # ESP-NOW security responder still uses protocomm security version 1.
 CONFIG_ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_1=y
+CONFIG_HTTPD_WS_SUPPORT=y  # SEP-0005: MCP agent WebSocket audio streams
