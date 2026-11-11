@@ -32,16 +32,18 @@ extern "C" void app_main(void)
 
     if (!skip_mooncake) {
         // Install apps
+        // SEP-0003: slim build — keep only AI.AGENT + SETUP (launcher stays as the desktop).
+        // Commented-out apps below are part of the phone-app ecosystem (archived, unused).
         GetMooncake().installApp(std::make_unique<AppLauncher>());
         hal_toggles::register_app_id(hal_toggles::App::AiAgent,
                                      GetMooncake().installApp(std::make_unique<AppAiAgent>()));
-        hal_toggles::register_app_id(hal_toggles::App::Avatar, GetMooncake().installApp(std::make_unique<AppAvatar>()));
-        hal_toggles::register_app_id(hal_toggles::App::EspnowRemote,
-                                     GetMooncake().installApp(std::make_unique<AppEspnowControl>()));
-        hal_toggles::register_app_id(hal_toggles::App::AppCenter,
-                                     GetMooncake().installApp(std::make_unique<AppAppCenter>()));
-        hal_toggles::register_app_id(hal_toggles::App::Ezdata, GetMooncake().installApp(std::make_unique<AppEzdata>()));
-        hal_toggles::register_app_id(hal_toggles::App::Dance, GetMooncake().installApp(std::make_unique<AppDance>()));
+        // hal_toggles::register_app_id(hal_toggles::App::Avatar, GetMooncake().installApp(std::make_unique<AppAvatar>()));
+        // hal_toggles::register_app_id(hal_toggles::App::EspnowRemote,
+        //                              GetMooncake().installApp(std::make_unique<AppEspnowControl>()));
+        // hal_toggles::register_app_id(hal_toggles::App::AppCenter,
+        //                              GetMooncake().installApp(std::make_unique<AppAppCenter>()));
+        // hal_toggles::register_app_id(hal_toggles::App::Ezdata, GetMooncake().installApp(std::make_unique<AppEzdata>()));
+        // hal_toggles::register_app_id(hal_toggles::App::Dance, GetMooncake().installApp(std::make_unique<AppDance>()));
         GetMooncake().installApp(std::make_unique<AppSetup>());
 
         // SEP-0002: automation console + http api (launch app by name)
