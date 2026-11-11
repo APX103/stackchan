@@ -308,6 +308,7 @@ idf_component_register(SRCS ${SOURCES}
                         esp_psram
                         esp_netif
                         esp_http_client
+                        esp_http_server
                         mbedtls
                         espressif__cjson
                         esp_eth

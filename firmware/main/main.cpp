@@ -10,6 +10,7 @@
 #include <apps/apps.h>
 #include <hal/hal.h>
 #include <hal/hal_toggles.h>
+#include <hal/sep/sep_automation.h>  // SEP-0002
 
 using namespace mooncake;
 using namespace smooth_ui_toolkit;
@@ -43,10 +44,15 @@ extern "C" void app_main(void)
         hal_toggles::register_app_id(hal_toggles::App::Dance, GetMooncake().installApp(std::make_unique<AppDance>()));
         GetMooncake().installApp(std::make_unique<AppSetup>());
 
+        // SEP-0002: automation console + http api (launch app by name)
+        sep::init();
+
         // Main loop
         while (1) {
             GetHAL().feedTheDog();
             GetHAL().updateHeapStatusLog();
+
+            sep::poll();  // SEP-0002: execute queued app launches
 
             GetMooncake().update();
 
