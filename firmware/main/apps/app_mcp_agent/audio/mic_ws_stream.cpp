@@ -68,26 +68,6 @@ void ws_send_job(void* arg) {
     delete job;
 }
 
-class CaptureCodecGuard {
-public:
-    explicit CaptureCodecGuard(AudioCodec* codec) : codec_(codec) {}
-    ~CaptureCodecGuard() { release(); }
-
-    void release()
-    {
-        if (codec_ == nullptr) return;
-        {
-            std::lock_guard<std::mutex> lock(mcp_dev::codec_mutex());
-            codec_->EnableInput(false);
-        }
-        mcp_audio::release_output(codec_);
-        codec_ = nullptr;
-    }
-
-private:
-    AudioCodec* codec_;
-};
-
 struct OpusEncoderDeleter {
     void operator()(void* encoder) const { if (encoder != nullptr) esp_opus_enc_close(encoder); }
 };
@@ -113,12 +93,12 @@ void MicWsStream::ReleaseClient(int fd, uint64_t session) {
     if (current == fd && self.session_.load() == session) {
         self.client_fd_.compare_exchange_strong(current, -1);
         self.session_++;
-        self.running_ = false;
+        // SEP: the capture task is persistent — do not kill it here. It
+        // notices the lost claim and releases its session (encoder,
+        // resampler, codec input) after the idle grace.
         if (self.mcp_service_ != nullptr) {
             self.mcp_service_->push_event("mic: client dropped");
         }
-        // The capture task notices the lost claim and parks itself after an
-        // idle grace period (its 22 KB stack returns to the heap then).
         ESP_LOGI(TAG, "client fd %d released", fd);
     }
 }
@@ -202,8 +182,8 @@ esp_err_t MicWsStream::WsHandlerImpl(httpd_req_t* req) {
         int expected = -1;
         if (self.client_fd_.compare_exchange_strong(expected, fd)) {
             self.session_++;
-            // Create the capture task on demand — its stack is only worth
-            // holding while a client actually streams.
+            // The capture task is normally already alive (pre-spawned at
+            // service start); this is only a safety net if it died.
             if (!self.EnsureCaptureTask()) {
                 const bool restarting = self.capture_task_ != nullptr && !self.task_exited_.load();
                 self.client_fd_ = -1;
@@ -234,13 +214,13 @@ esp_err_t MicWsStream::WsHandlerImpl(httpd_req_t* req) {
         return wsutil::SendError(req, "busy");
     }
 
-    // stop: release the stream, capture task goes idle
+    // stop: release the client claim; the persistent capture task releases
+    // its session after the idle grace.
     if (strstr(msg, "\"stop\"") != nullptr) {
         int current = self.client_fd_.load();
         if (current == fd) {
             self.client_fd_.compare_exchange_strong(current, -1);
             self.session_++;
-            self.running_ = false;
             if (self.mcp_service_ != nullptr) {
                 self.mcp_service_->push_event("mic: client stopped");
             }
@@ -270,88 +250,41 @@ void MicWsStream::CaptureTask(void* arg) {
 void MicWsStream::CaptureTaskImpl(void* arg) {
     auto& self = *static_cast<MicWsStream*>(arg);
 
-    auto* codec = mcp_dev::audio_codec("mic capture");
-    if (codec == nullptr) {
-        ESP_LOGE(TAG, "board has no audio codec, mic stream disabled");
-        self.client_fd_ = -1;
-        self.session_++;
-        return;
-    }
-    mcp_audio::acquire_output(codec);
-    CaptureCodecGuard codec_guard(codec);
-    {
-        // The speaker task initializes its codec side at the same time;
-        // control calls must not interleave (see device_access.h).
-        std::lock_guard<std::mutex> lock(mcp_dev::codec_mutex());
-        codec->EnableInput(true);
-        codec->Start();
-    }
-
-    // The I2S stream is interleaved stereo: slot 0 = microphone, slot 1 =
-    // playback reference (measured: [mic, -2, mic, -2...]). Effective mic
-    // rate is the configured 24 kHz (1440 mic samples arrive every 60 ms
-    // inside 2880 interleaved samples).
-    const uint32_t in_rate_config = codec->input_sample_rate();
-    const bool need_resample      = in_rate_config != kOpusSampleRate;
+    // SEP: this task is persistent — pre-spawned at service start (see
+    // lan_service.cpp). Lazily creating its 22 KB stack inside a client
+    // "start" loses the memory lottery exactly like the speaker playback
+    // task did (observed: largest 21504 < 22528 right after a speaker
+    // session). The streaming session — codec input bus, resampler,
+    // encoder, buffers — is acquired when a client claims the stream and
+    // released after the idle grace, so a parked task costs only its stack.
+    AudioCodec* codec = nullptr;
+    bool bus_acquired = false;
     esp_ae_rate_cvt_handle_t resampler = nullptr;
     std::unique_ptr<void, ResamplerDeleter> resampler_guard(nullptr);
-    if (need_resample) {
-        esp_ae_rate_cvt_cfg_t rs_cfg  = {};
-        rs_cfg.src_rate               = in_rate_config;
-        rs_cfg.dest_rate              = kOpusSampleRate;
-        rs_cfg.channel                = 1;
-        rs_cfg.bits_per_sample        = ESP_AUDIO_BIT16;
-        rs_cfg.complexity             = 2;
-        rs_cfg.perf_type              = ESP_AE_RATE_CVT_PERF_TYPE_SPEED;
-        if (esp_ae_rate_cvt_open(&rs_cfg, &resampler) != ESP_AE_ERR_OK) {
-            ESP_LOGE(TAG, "failed to open resampler %lu->%d", in_rate_config, kOpusSampleRate);
-            self.client_fd_ = -1;
-            self.session_++;
-            return;
-        }
-        resampler_guard.reset(resampler);
-    }
-
-    // Opus encoder, same profile the cloud agent's audio service encodes
-    // with: 16k mono, 60 ms frames, complexity 0, DTX+VBR.
-    esp_opus_enc_config_t enc_cfg = {};
-    enc_cfg.sample_rate           = ESP_AUDIO_SAMPLE_RATE_16K;
-    enc_cfg.channel               = ESP_AUDIO_MONO;
-    enc_cfg.bits_per_sample       = ESP_AUDIO_BIT16;
-    enc_cfg.bitrate               = ESP_OPUS_BITRATE_AUTO;
-    enc_cfg.frame_duration        = ESP_OPUS_ENC_FRAME_DURATION_60_MS;
-    enc_cfg.application_mode      = ESP_OPUS_ENC_APPLICATION_AUDIO;
-    enc_cfg.complexity            = 0;
-    enc_cfg.enable_fec            = false;
-    enc_cfg.enable_dtx            = true;
-    enc_cfg.enable_vbr            = true;
+    bool need_resample = false;
     void* encoder = nullptr;
-    if (esp_opus_enc_open(&enc_cfg, sizeof(enc_cfg), &encoder) != ESP_AUDIO_ERR_OK || encoder == nullptr) {
-        ESP_LOGE(TAG, "failed to open opus encoder");
-        self.client_fd_ = -1;
-        self.session_++;
-        return;
-    }
-    std::unique_ptr<void, OpusEncoderDeleter> encoder_guard(encoder);
-    int frame_bytes = 0;
-    int out_bytes   = 0;
-    esp_opus_enc_get_frame_size(encoder, &frame_bytes, &out_bytes);
-    const size_t frame_samples = frame_bytes / sizeof(int16_t);  // 960 @ 60 ms
+    std::unique_ptr<void, OpusEncoderDeleter> encoder_guard(nullptr);
+    size_t frame_samples = 0;
+    std::vector<int16_t> in_buf, mic_buf, rs_buf, pcm;
+    std::vector<uint8_t> enc_buf;
 
-    // One 60 ms chunk at the codec rate, including both interleaved slots.
-    const size_t in_chunk     = in_rate_config / 1000 * kFrameMs * 2;
-    std::vector<int16_t> in_buf(in_chunk);
-    std::vector<int16_t> mic_buf(in_chunk / 2);  // de-interleaved mic channel
-    std::vector<int16_t> rs_buf(in_chunk);
-    std::vector<int16_t> pcm;
-    pcm.reserve(frame_samples * 2);
-    std::vector<uint8_t> enc_buf(out_bytes);
-
-    ESP_LOGI(TAG, "capture task ready (in %lu Hz interleaved stereo, resample %d, opus %d samples/frame)",
-             in_rate_config, need_resample, frame_samples);
-
+    auto release_session = [&]() {
+        encoder_guard.reset();
+        encoder = nullptr;
+        resampler_guard.reset();
+        resampler = nullptr;
+        if (bus_acquired) {
+            {
+                std::lock_guard<std::mutex> lock(mcp_dev::codec_mutex());
+                codec->EnableInput(false);
+            }
+            mcp_audio::release_output(codec);
+            bus_acquired = false;
+        }
+    };
     // One-shot progress logs: enough to tell where the pipeline stalls
     // without flooding the console.
+    bool logged_session   = false;
     bool logged_first_read = false;
     bool logged_first_enc  = false;
     int rs_err_count       = 0;
@@ -366,15 +299,104 @@ void MicWsStream::CaptureTaskImpl(void* arg) {
     while (self.running_) {
         const int fd = self.client_fd_;
         if (fd < 0) {
-            // No client: after the idle grace the task parks itself and its
-            // stack returns to the heap (recreated on the next "start").
-            if (++idle_ticks >= 30) {
-                break;
+            // No client: after the idle grace, hand the session (encoder,
+            // resampler, codec input) back. The task itself stays parked.
+            if ((bus_acquired || encoder != nullptr) && ++idle_ticks >= 30) {
+                release_session();
+                logged_session = false;
+                ESP_LOGI(TAG, "mic idle: session released");
             }
             vTaskDelay(pdMS_TO_TICKS(100));  // idle, no client
             continue;
         }
         idle_ticks = 0;
+
+        if (!bus_acquired) {
+            codec = mcp_dev::audio_codec("mic capture");
+            if (codec == nullptr) {
+                ESP_LOGE(TAG, "board has no audio codec, mic stream disabled");
+                self.client_fd_ = -1;
+                self.session_++;
+                vTaskDelay(pdMS_TO_TICKS(100));
+                continue;
+            }
+            mcp_audio::acquire_output(codec);
+            {
+                // The speaker task initializes its codec side at the same
+                // time; control calls must not interleave (see
+                // device_access.h).
+                std::lock_guard<std::mutex> lock(mcp_dev::codec_mutex());
+                codec->EnableInput(true);
+                codec->Start();
+            }
+            bus_acquired = true;
+
+            // The I2S stream is interleaved stereo: slot 0 = microphone,
+            // slot 1 = playback reference (measured: [mic, -2, mic, -2...]).
+            // Effective mic rate is the configured 24 kHz (1440 mic samples
+            // arrive every 60 ms inside 2880 interleaved samples).
+            const uint32_t in_rate_config = codec->input_sample_rate();
+            need_resample = in_rate_config != kOpusSampleRate;
+            if (need_resample) {
+                esp_ae_rate_cvt_cfg_t rs_cfg  = {};
+                rs_cfg.src_rate               = in_rate_config;
+                rs_cfg.dest_rate              = kOpusSampleRate;
+                rs_cfg.channel                = 1;
+                rs_cfg.bits_per_sample        = ESP_AUDIO_BIT16;
+                rs_cfg.complexity             = 2;
+                rs_cfg.perf_type              = ESP_AE_RATE_CVT_PERF_TYPE_SPEED;
+                if (esp_ae_rate_cvt_open(&rs_cfg, &resampler) != ESP_AE_ERR_OK) {
+                    ESP_LOGE(TAG, "failed to open resampler %lu->%d", in_rate_config, kOpusSampleRate);
+                    release_session();
+                    self.client_fd_ = -1;
+                    self.session_++;
+                    continue;
+                }
+                resampler_guard.reset(resampler);
+            }
+
+            // Opus encoder, same profile the cloud agent's audio service
+            // encodes with: 16k mono, 60 ms frames, complexity 0, DTX+VBR.
+            esp_opus_enc_config_t enc_cfg = {};
+            enc_cfg.sample_rate           = ESP_AUDIO_SAMPLE_RATE_16K;
+            enc_cfg.channel               = ESP_AUDIO_MONO;
+            enc_cfg.bits_per_sample       = ESP_AUDIO_BIT16;
+            enc_cfg.bitrate               = ESP_OPUS_BITRATE_AUTO;
+            enc_cfg.frame_duration        = ESP_OPUS_ENC_FRAME_DURATION_60_MS;
+            enc_cfg.application_mode      = ESP_OPUS_ENC_APPLICATION_AUDIO;
+            enc_cfg.complexity            = 0;
+            enc_cfg.enable_fec            = false;
+            enc_cfg.enable_dtx            = true;
+            enc_cfg.enable_vbr            = true;
+            if (esp_opus_enc_open(&enc_cfg, sizeof(enc_cfg), &encoder) != ESP_AUDIO_ERR_OK || encoder == nullptr) {
+                ESP_LOGE(TAG, "failed to open opus encoder");
+                release_session();
+                self.client_fd_ = -1;
+                self.session_++;
+                continue;
+            }
+            encoder_guard.reset(encoder);
+
+            int frame_bytes = 0;
+            int out_bytes   = 0;
+            esp_opus_enc_get_frame_size(encoder, &frame_bytes, &out_bytes);
+            frame_samples = frame_bytes / sizeof(int16_t);  // 960 @ 60 ms
+
+            // One 60 ms chunk at the codec rate, both interleaved slots.
+            const size_t in_chunk = in_rate_config / 1000 * kFrameMs * 2;
+            in_buf.assign(in_chunk, 0);
+            mic_buf.assign(in_chunk / 2, 0);  // de-interleaved mic channel
+            rs_buf.assign(in_chunk, 0);
+            pcm.clear();
+            pcm.reserve(frame_samples * 2);
+            enc_buf.assign(out_bytes, 0);
+
+            if (!logged_session) {
+                ESP_LOGI(TAG, "capture session ready (in %lu Hz interleaved stereo, resample %d, opus %d samples/frame)",
+                         (unsigned long)in_rate_config, need_resample, (int)frame_samples);
+                logged_session = true;
+            }
+        }
 
         // Blocks until the codec delivers a chunk (~60 ms) — natural pacing.
         if (!codec->InputData(in_buf)) {
@@ -463,9 +485,7 @@ void MicWsStream::CaptureTaskImpl(void* arg) {
         }
     }
 
-    encoder_guard.reset();
-    resampler_guard.reset();
-    codec_guard.release();
+    release_session();
     ESP_LOGI(TAG, "capture task stopped");
 }
 
@@ -478,9 +498,9 @@ bool MicWsStream::Start(httpd_handle_t server, mcp_lan::LanService& service) {
         return true;  // already running
     }
     server_ = server;
-    // The capture task is created lazily on the first client "start" (see
-    // WsHandler): its 22 KB stack must not sit in the heap while nobody
-    // streams — internal RAM is the scarcest resource on this board.
+    // SEP: the capture task is pre-spawned at service start (see
+    // lan_service.cpp) and parks with no session while nobody streams, so
+    // its 22 KB stack is the only cost of keeping it alive.
     httpd_uri_t ws_mic              = {};
     ws_mic.uri                      = "/mic";
     ws_mic.method                   = HTTP_GET;
@@ -515,11 +535,11 @@ bool MicWsStream::EnsureCaptureTask() {
     if (mcp_dev::audio_codec("mic capture") == nullptr) {
         return false;
     }
-    // Clean up a previously parked task first (its stack is still held
-    // until deleted with WithCaps semantics).
     if (capture_task_ != nullptr) {
         if (!task_exited_.load()) {
-            return false;  // previous capture is still stopping cooperatively
+            // SEP: the task is persistent — alive means parked waiting for a
+            // client and ready to stream, not "still stopping".
+            return true;
         }
         vTaskDeleteWithCaps(capture_task_);
         capture_task_ = nullptr;

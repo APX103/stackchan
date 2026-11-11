@@ -42,8 +42,13 @@ public:
         return instance;
     }
 
-    // Registers /mic; the capture task is created on the first client start.
+    // Registers /mic; the capture task is pre-spawned at service start.
     bool Start(httpd_handle_t server, mcp_lan::LanService& service);
+
+    // SEP: create the persistent capture task (idempotent). Called once at
+    // service start while internal RAM is still contiguous — lazily creating
+    // the 22 KB stack under request pressure fails (see CaptureTaskImpl).
+    bool EnsureCaptureTask();
 
     // Disconnects the client and stops capturing before HTTPD is stopped.
     void Stop();
@@ -94,9 +99,6 @@ private:
     static esp_err_t WsHandlerImpl(httpd_req_t* req);
     static void CaptureTask(void* arg);
     static void CaptureTaskImpl(void* arg);
-    // Creates the capture task on the first client "start" (lazy: the stack
-    // is only held while somebody streams). False when out of memory.
-    bool EnsureCaptureTask();
 
     std::atomic<httpd_handle_t> server_{nullptr};
     mcp_lan::LanService* mcp_service_ = nullptr;

@@ -52,7 +52,7 @@ AppMcpAgent::~AppMcpAgent()
 AppMcpAgent::AppMcpAgent()
 {
     // Configure App name
-    setAppInfo().name = "MCP.AGENT";
+    setAppInfo().name = "MIWAVE.AGENT";
     // Server-stack glyph (generated, RGB565A8, same format as the other icons)
     static auto icon  = assets::get_image("icon_mcp_agent.bin");
     setAppInfo().icon = (void*)&icon;

@@ -33,20 +33,6 @@ constexpr size_t kMaxQueuedPackets = 100;  // SEP: ~6s buffer, absorb LAN bursts
 constexpr int kFrameMs = 60;
 
 namespace {
-class PlaybackCodecGuard {
-public:
-    explicit PlaybackCodecGuard(AudioCodec* codec) : codec_(codec) {}
-    ~PlaybackCodecGuard() { release(); }
-    void release()
-    {
-        if (codec_ != nullptr) {
-            mcp_audio::release_output(codec_);
-            codec_ = nullptr;
-        }
-    }
-private:
-    AudioCodec* codec_;
-};
 struct OpusDecoderDeleter {
     void operator()(void* decoder) const { if (decoder != nullptr) esp_opus_dec_close(decoder); }
 };
@@ -70,34 +56,27 @@ void SpeakerWsStream::PlaybackTask(void* arg) {
 void SpeakerWsStream::PlaybackTaskImpl(void* arg) {
     auto& self = *static_cast<SpeakerWsStream*>(arg);
 
-    auto* codec = mcp_dev::audio_codec("speaker playback");
-    if (codec == nullptr) {
-        ESP_LOGE(TAG, "board has no audio codec, speaker stream disabled");
-        return;
-    }
-    // The duplex I2S bus is clocked from the output side and the mic capture
-    // task already opened it; these calls are idempotent covers for the case
-    // where it has not. Control calls are serialized against the mic task.
-    mcp_audio::acquire_output(codec);
-    PlaybackCodecGuard codec_guard(codec);
-    {
-        std::lock_guard<std::mutex> lock(mcp_dev::codec_mutex());
-        codec->Start();
-    }
-
-    // The decoder is opened lazily on the first packet: while the speaker is
-    // unused the ~30 KB it needs stay available to the rest of the system.
+    // SEP: this task is persistent — pre-spawned at service start (see
+    // lan_service.cpp), while internal RAM is still contiguous. Creating it
+    // lazily inside a play_opus request loses the memory lottery: the
+    // request's own ~28 KB JSON body occupies the largest free block first
+    // (observed: largest 10240 < 12288-byte stack -> "playback task
+    // unavailable"). Because it now outlives every client and every tool
+    // call, it must not hold the codec output or the ~30 KB decoder while
+    // idle: both are acquired on the first packet and released after
+    // sustained idle, so the mic side is never blocked either.
     void* decoder = nullptr;
     std::unique_ptr<void, OpusDecoderDeleter> decoder_guard(nullptr);
-    // Opus frame of 60 ms at the codec output rate (24 kHz -> 1440 samples).
-    const size_t frame_samples = codec->output_sample_rate() / 1000 * kFrameMs;
-    std::vector<int16_t> pcm(frame_samples);
+    AudioCodec* codec = nullptr;
+    bool output_acquired = false;
+    size_t frame_samples = 0;
+    std::vector<int16_t> pcm;
     uint32_t played = 0;
     int decode_errs = 0;
+    int idle_secs = 0;
+    bool codec_warned = false;
+    constexpr int kIdleReleaseSecs = 5;
 
-    // Decoder is opened lazily on the first packet; the task parks itself
-    // after ~3 s without a client, returning its stack to the heap.
-    int idle_ticks = 0;
     while (self.running_) {
         std::shared_ptr<std::vector<uint8_t>> packet;
         {
@@ -108,14 +87,49 @@ void SpeakerWsStream::PlaybackTaskImpl(void* arg) {
                 break;
             }
             if (self.packet_queue_.empty()) {
-                if (self.client_fd_.load() < 0 && ++idle_ticks >= 3) {
-                    break;  // no client, no audio: park and free the stack
+                // No packets: after a quiet spell with no WS client, hand the
+                // decoder (~30 KB) and the codec output back. The task itself
+                // stays parked on the condition variable.
+                if (self.client_fd_.load() < 0 && ++idle_secs >= kIdleReleaseSecs &&
+                    (decoder != nullptr || output_acquired)) {
+                    lock.unlock();  // releases below take their own locks
+                    decoder_guard.reset();
+                    decoder = nullptr;  // reset() alone leaves the raw pointer stale
+                    if (output_acquired) {
+                        mcp_audio::release_output(codec);
+                        output_acquired = false;
+                    }
+                    ESP_LOGI(TAG, "playback idle: decoder/output released");
                 }
                 continue;  // idle tick: re-check running_
             }
-            idle_ticks = 0;
+            idle_secs = 0;
             packet = std::move(self.packet_queue_.front());
             self.packet_queue_.pop_front();
+        }
+
+        if (!output_acquired) {
+            // The duplex I2S bus is clocked from the output side and the mic
+            // capture task may already have opened it; control calls are
+            // serialized against the mic task through codec_bus.
+            codec = mcp_dev::audio_codec("speaker playback");
+            if (codec == nullptr) {
+                if (!codec_warned) {
+                    ESP_LOGE(TAG, "audio codec unavailable, packets dropped");
+                    codec_warned = true;
+                }
+                continue;
+            }
+            mcp_audio::acquire_output(codec);
+            {
+                std::lock_guard<std::mutex> lock(mcp_dev::codec_mutex());
+                codec->Start();
+            }
+            output_acquired = true;
+            // Opus frame of 60 ms at the codec output rate (24 kHz -> 1440
+            // samples); sized once the codec is known.
+            frame_samples = codec->output_sample_rate() / 1000 * kFrameMs;
+            pcm.assign(frame_samples, 0);
         }
 
         if (decoder == nullptr) {
@@ -162,7 +176,9 @@ void SpeakerWsStream::PlaybackTaskImpl(void* arg) {
     }
 
     decoder_guard.reset();
-    codec_guard.release();
+    if (output_acquired) {
+        mcp_audio::release_output(codec);
+    }
     ESP_LOGI(TAG, "playback task stopped (%u packets played)", (unsigned)played);
 }
 
@@ -173,7 +189,10 @@ void SpeakerWsStream::HandleDisconnect(httpd_handle_t server, int fd) {
     }
     int current = self.client_fd_.load();
     if (current == fd && self.client_fd_.compare_exchange_strong(current, -1)) {
-        self.running_ = false;
+        // SEP: the playback task is persistent — a client leaving must not
+        // kill it (recreating it mid-request loses the memory lottery; see
+        // PlaybackTaskImpl). Drop buffered packets so the next session starts
+        // clean; the task parks and releases decoder/output after idle.
         {
             std::lock_guard<std::mutex> lock(self.queue_mutex_);
             self.packet_queue_.clear();
@@ -261,8 +280,8 @@ esp_err_t SpeakerWsStream::WsHandlerImpl(httpd_req_t* req) {
     if (strstr(msg, "\"start\"") != nullptr) {
         int expected = -1;
         if (self.client_fd_.compare_exchange_strong(expected, fd)) {
-            // Playback task is created on demand — its stack is only worth
-            // holding while a client actually streams.
+            // The playback task is normally already alive (pre-spawned at
+            // service start); this is only a safety net if it died.
             if (!self.EnsurePlaybackTask()) {
                 const bool restarting = self.playback_task_ != nullptr && !self.task_exited_.load();
                 self.client_fd_ = -1;
@@ -288,7 +307,6 @@ esp_err_t SpeakerWsStream::WsHandlerImpl(httpd_req_t* req) {
                 "\"frame_ms\":60,\"codec\":\"opus\"}";
             if (wsutil::SendText(req, kHello) != ESP_OK) {
                 self.client_fd_ = -1;
-                self.running_ = false;
                 self.queue_cv_.notify_all();
             }
             return ESP_OK;
@@ -302,8 +320,9 @@ esp_err_t SpeakerWsStream::WsHandlerImpl(httpd_req_t* req) {
     if (strstr(msg, "\"stop\"") != nullptr) {
         int current = self.client_fd_.load();
         if (current == fd) {
+            // SEP: 打断/停播。常驻播放任务不许杀——只释放客户端并清空
+            // 队列,任务回到驻留待命(见 PlaybackTaskImpl)。
             self.client_fd_.compare_exchange_strong(current, -1);
-            self.running_ = false;
             {
                 std::lock_guard<std::mutex> lock(self.queue_mutex_);
                 self.packet_queue_.clear();
@@ -370,10 +389,11 @@ bool SpeakerWsStream::EnsurePlaybackTask() {
     if (mcp_dev::audio_codec("speaker playback") == nullptr) {
         return false;
     }
-    // Clean up a previously parked task first.
     if (playback_task_ != nullptr) {
         if (!task_exited_.load()) {
-            return false;  // previous playback is still stopping cooperatively
+            // SEP: the task is persistent — alive means parked on the queue
+            // and ready to play, not "still stopping".
+            return true;
         }
         vTaskDeleteWithCaps(playback_task_);
         playback_task_ = nullptr;

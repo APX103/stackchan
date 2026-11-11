@@ -15,6 +15,8 @@
 
 #include <cstdarg>
 #include <vector>
+#include <algorithm>
+#include <cstring>
 
 #include <cJSON.h>
 
@@ -23,6 +25,7 @@
 #include "../platform/device_access.h"
 #include "../protocol/mcp_jsonrpc.h"
 #include "../protocol/http_guard.h"
+#include "../protocol/ws_util.h"
 #include "../tools/mcp_photo.h"
 
 static const char* TAG = "McpSvc";
@@ -35,10 +38,13 @@ constexpr int64_t kToolTimeoutUs = 30000000;
 
 namespace mcp_lan {
 
+// close_fn 是纯函数指针拿不到 user_ctx;App 生命周期内只有一个服务实例,
+// 用文件内指针转发 /events 的注销(与 Mic/Speaker 流同款生命周期假设)。
+LanService* g_events_service = nullptr;
+
 struct LanService::AsyncToolJob {
     const Tool* tool = nullptr;
     cJSON* args = nullptr;
-    cJSON* id = nullptr;
     httpd_req_t* req = nullptr;
     ToolOutput result;
     int64_t deadline_us = 0;
@@ -48,7 +54,6 @@ struct LanService::AsyncToolJob {
     ~AsyncToolJob()
     {
         cJSON_Delete(args);
-        cJSON_Delete(id);
         if (req != nullptr) {
             httpd_req_async_handler_complete(req);
             req = nullptr;
@@ -72,7 +77,7 @@ esp_err_t status_handler_impl(httpd_req_t* req)
     const auto st = service.status();
     cJSON* root = cJSON_CreateObject();
     if (root == nullptr) {
-        return send_json(req, make_error_json(nullptr, -32603, "out of memory"), "500 Internal Server Error");
+        return send_json(req, make_rest_error("out of memory"), "500 Internal Server Error");
     }
     cJSON_AddStringToObject(root, "name", "stackchan-mcp");
     cJSON_AddStringToObject(root, "version", "1.0.0");
@@ -96,7 +101,7 @@ esp_err_t status_handler_impl(httpd_req_t* req)
     char* printed = cJSON_PrintUnformatted(root);
     if (printed == nullptr) {
         cJSON_Delete(root);
-        return send_json(req, make_error_json(nullptr, -32603, "out of memory"), "500 Internal Server Error");
+        return send_json(req, make_rest_error("out of memory"), "500 Internal Server Error");
     }
     const esp_err_t ret = send_json(req, printed);
     cJSON_free(printed);
@@ -108,7 +113,7 @@ esp_err_t photo_handler_impl(httpd_req_t* req)
 {
     auto& service = *static_cast<LanService*>(req->user_ctx);
     if (!service.http_authorized(req)) {
-        return send_json(req, make_error_json(nullptr, -32001, "unauthorized"), "401 Unauthorized");
+        return send_json(req, make_rest_error("unauthorized"), "401 Unauthorized");
     }
     mcp_photo::PhotoSnapshot snapshot;
     if (!mcp_photo::get(&snapshot)) {
@@ -258,6 +263,9 @@ bool LanService::start(std::string* err)
     config.ctrl_port = kHttpdCtrlPort;
     config.stack_size = kHttpdStackSize;
     config.lru_purge_enable = true;
+    // SEP 服务化:默认 8 个 handler 槽装不下(/,/photo,/events,/mic,/speaker
+    // + 12 条 REST),注册超槽直接导致服务启动失败(实测 no slots left)
+    config.max_uri_handlers = 24;
     // LWIP_MAX_SOCKETS=10 leaves seven client sockets after HTTPD's three
     // internal sockets. JSON responses use Connection: close; async jobs and
     // the two WebSocket streams remain explicitly bounded.
@@ -265,6 +273,7 @@ bool LanService::start(std::string* err)
     config.close_fn = [](httpd_handle_t server, int fd) {
         MicWsStream::HandleDisconnect(server, fd);
         SpeakerWsStream::HandleDisconnect(server, fd);
+        LanService::handle_ws_close(fd);
         // httpd_sess_delete() delegates the actual close to close_fn too.
         close(fd);
     };
@@ -275,6 +284,7 @@ bool LanService::start(std::string* err)
         return false;
     }
     httpd_.store(server);
+    g_events_service = this;  // close_fn 无 user_ctx,经此转发 /events 注销
 
     httpd_uri_t status_uri = {};
     status_uri.uri = "/";
@@ -286,6 +296,17 @@ bool LanService::start(std::string* err)
     photo_uri.method = HTTP_GET;
     photo_uri.handler = photo_handler;
     photo_uri.user_ctx = this;
+    // SEP 服务化:WS /events —— 服务器主动推事件(触摸手势等)
+    httpd_uri_t events_uri = {};
+    events_uri.uri = "/events";
+    events_uri.method = HTTP_GET;
+    events_uri.handler = events_ws_handler;
+    events_uri.is_websocket = true;
+    events_uri.handle_ws_control_frames = false;
+    events_uri.user_ctx = this;
+#if CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT
+    events_uri.ws_pre_handshake_cb = events_pre_handshake;
+#endif
 
     // SEP: pre-initialize the audio codec while internal RAM is still
     // plentiful (later, with avatar+service+WS all live, the preflight in
@@ -293,9 +314,22 @@ bool LanService::start(std::string* err)
     // codec() caches the pointer, so later callers cost nothing.
     mcp_dev::audio_codec("mcp codec preload");
 
+    // SEP: also pre-spawn the persistent speaker playback task while the
+    // largest internal block is still ~32 KB. Creating it lazily inside a
+    // play_opus request fails because the request's own JSON body (~28 KB at
+    // 120 frames/batch) occupies that block first (observed largest=10240 <
+    // the 12288-byte task stack -> "playback task unavailable"). The task
+    // parks on its queue and releases codec+decoder after idle, so it costs
+    // nothing but the 12 KB stack.
+    SpeakerWsStream::GetInstance().EnsurePlaybackTask();
+    // Same treatment for the mic capture task (22 KB stack): pre-spawn while
+    // RAM is contiguous instead of gambling on the first /mic client.
+    MicWsStream::GetInstance().EnsureCaptureTask();
+
     const bool ok = httpd_register_uri_handler(server, &status_uri) == ESP_OK &&
                     httpd_register_uri_handler(server, &photo_uri) == ESP_OK &&
-                    register_mcp_endpoint(server, *this) &&
+                    httpd_register_uri_handler(server, &events_uri) == ESP_OK &&
+                    register_rest_endpoints(server, *this) &&
                     MicWsStream::GetInstance().Start(server, *this) &&
                     SpeakerWsStream::GetInstance().Start(server, *this);
     if (!ok) {
@@ -306,7 +340,7 @@ bool LanService::start(std::string* err)
 
     running_.store(true);
     push_event("service started on port %d", CONFIG_MCP_AGENT_PORT);
-    ESP_LOGI(TAG, "MCP Agent service on http://<ip>:%d/mcp", CONFIG_MCP_AGENT_PORT);
+    ESP_LOGI(TAG, "MIWAVE.AGENT service on http://<ip>:%d (REST + WS)", CONFIG_MCP_AGENT_PORT);
     return true;
 }
 
@@ -358,19 +392,17 @@ void LanService::reclaim()
     executor_.active.clear();
 }
 
-esp_err_t LanService::submit_tool(const Tool* tool, cJSON* args, cJSON* id, httpd_req_t* req)
+esp_err_t LanService::submit_tool(const Tool* tool, cJSON* args, httpd_req_t* req)
 {
     JobPtr job;
     try {
         job = std::make_shared<AsyncToolJob>();
     } catch (...) {
         cJSON_Delete(args);
-        cJSON_Delete(id);
         throw;
     }
     job->tool = tool;
     job->args = args;
-    job->id = id;
     job->deadline_us = esp_timer_get_time() + kToolTimeoutUs;
 
     uint64_t job_id = 0;
@@ -396,8 +428,7 @@ esp_err_t LanService::submit_tool(const Tool* tool, cJSON* args, cJSON* id, http
     if (job_id == 0) {
         const bool queue_full = immediate == FinishKind::QueueFull;
         return send_json(req,
-                         make_error_json(id, -32603,
-                                         queue_full ? "tool queue is full" : "tool executor is unavailable"),
+                         make_rest_error(queue_full ? "tool queue is full" : "tool executor is unavailable"),
                          "503 Service Unavailable");
     }
 
@@ -426,7 +457,7 @@ esp_err_t LanService::submit_tool(const Tool* tool, cJSON* args, cJSON* id, http
                 }
             }
         }
-        return send_json(req, make_error_json(id, -32603, "failed to start async request"),
+        return send_json(req, make_rest_error("failed to start async request"),
                          "500 Internal Server Error");
     }
 
@@ -479,20 +510,20 @@ void LanService::finish_request(const JobPtr& job, FinishKind kind)
     switch (kind) {
         case FinishKind::Success:
             note_tool_result(job->result.is_error);
-            body = make_tool_result_json(job->id, job->result);
+            body = make_rest_result(job->result);
             break;
         case FinishKind::Timeout:
-            body = make_error_json(job->id, -32603, "tool execution timeout");
+            body = make_rest_error("tool execution timeout");
             break;
         case FinishKind::Cancelled:
-            body = make_error_json(job->id, -32603, "service is stopping");
+            body = make_rest_error("service is stopping");
             break;
         case FinishKind::QueueFull:
-            body = make_error_json(job->id, -32603, "tool queue is full");
+            body = make_rest_error("tool queue is full");
             status = "503 Service Unavailable";
             break;
         case FinishKind::StartFailure:
-            body = make_error_json(job->id, -32603, "tool executor is unavailable");
+            body = make_rest_error("tool executor is unavailable");
             status = "503 Service Unavailable";
             break;
     }
@@ -719,11 +750,128 @@ void LanService::note_tool_result(bool is_error)
 
 void LanService::push_event(const char* fmt, ...)
 {
-    std::lock_guard<std::mutex> lock(stats_.mtx);
+    char text[96] = {0};
     va_list args;
     va_start(args, fmt);
-    vsnprintf(stats_.last_event, sizeof(stats_.last_event), fmt, args);
+    vsnprintf(text, sizeof(text), fmt, args);
     va_end(args);
+    {
+        std::lock_guard<std::mutex> lock(stats_.mtx);
+        strlcpy(stats_.last_event, text, sizeof(stats_.last_event));
+    }
+    // SEP 服务化:镜像推给 /events 订阅者(无订阅者时零成本)
+    broadcast_event(text);
+}
+
+// ---------------------------------------------------------------------------
+// WS /events 事件通道
+// ---------------------------------------------------------------------------
+
+namespace {
+struct EventSendJob {
+    httpd_handle_t server;
+    int fd;
+    std::string text;
+};
+
+void event_send_job(void* arg)
+{
+    auto* job = static_cast<EventSendJob*>(arg);
+    httpd_ws_frame_t frame = {};
+    frame.type    = HTTPD_WS_TYPE_TEXT;
+    frame.payload = (uint8_t*)job->text.data();
+    frame.len     = job->text.size();
+    httpd_ws_send_frame_async(job->server, job->fd, &frame);
+    delete job;
+}
+}  // namespace
+
+void LanService::add_event_client(int fd)
+{
+    std::lock_guard<std::mutex> lock(event_fds_mtx_);
+    if (std::find(event_fds_.begin(), event_fds_.end(), fd) == event_fds_.end()) {
+        event_fds_.push_back(fd);
+        ESP_LOGI(TAG, "events: client fd %d subscribed (%zu total)", fd, event_fds_.size());
+    }
+}
+
+void LanService::remove_event_client(int fd)
+{
+    std::lock_guard<std::mutex> lock(event_fds_mtx_);
+    auto it = std::find(event_fds_.begin(), event_fds_.end(), fd);
+    if (it != event_fds_.end()) {
+        event_fds_.erase(it);
+        ESP_LOGI(TAG, "events: client fd %d unsubscribed (%zu total)", fd, event_fds_.size());
+    }
+}
+
+void LanService::handle_ws_close(int fd)
+{
+    if (g_events_service != nullptr) {
+        g_events_service->remove_event_client(fd);
+    }
+}
+
+void LanService::broadcast_event(const char* text)
+{
+    httpd_handle_t server = httpd_.load();
+    if (server == nullptr) {
+        return;
+    }
+    // JSON 包装:{"type":"event","text":"..."}(转义交给 cJSON)
+    cJSON* root = cJSON_CreateObject();
+    if (root == nullptr) {
+        return;
+    }
+    cJSON_AddStringToObject(root, "type", "event");
+    cJSON_AddStringToObject(root, "text", text);
+    char* printed = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (printed == nullptr) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(event_fds_mtx_);
+    for (int fd : event_fds_) {
+        auto* job = new (std::nothrow) EventSendJob{server, fd, printed};
+        if (job == nullptr) {
+            continue;
+        }
+        // 工作队列满则丢弃该订阅者的这条事件(事件是尽力而为的)
+        if (httpd_queue_work(server, event_send_job, job) != ESP_OK) {
+            delete job;
+        }
+    }
+    cJSON_free(printed);
+}
+
+esp_err_t LanService::events_pre_handshake(httpd_req_t* req)
+{
+    auto* service = static_cast<LanService*>(req->user_ctx);
+    if (service == nullptr || !service->running() || !service->ws_authorized(req)) {
+        httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "unauthorized");
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+esp_err_t LanService::events_ws_handler(httpd_req_t* req)
+{
+    auto* service = static_cast<LanService*>(req->user_ctx);
+    if (service == nullptr || !service->running() || !service->ws_authorized(req)) {
+        return ESP_FAIL;  // close the session
+    }
+    // WS handler 必须消费帧(与 mic/speaker 同款),否则 httpd 会话失步
+    // 并断连(实测 "WS frame is not properly masked" 后连接被踢)。
+    httpd_ws_frame_t pkt;
+    std::vector<uint8_t> payload;
+    if (wsutil::RecvFrame(req, &pkt, &payload) != ESP_OK) {
+        return ESP_OK;  // 读失败交回 httpd 收尾;订阅由 close_fn 注销
+    }
+    // 任意一帧(约定首帧 {"type":"hello"})即视为订阅;后续帧静默消费。
+    const int fd = httpd_req_to_sockfd(req);
+    service->add_event_client(fd);
+    return ESP_OK;
 }
 
 void LanService::request_reboot()

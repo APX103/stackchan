@@ -18,6 +18,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "../protocol/mcp_registry.h"
 #include "apps/common/reminder/reminder.h"
@@ -81,7 +82,7 @@ public:
 
     // Admits the job before creating an async request, so immediate failures
     // are always answered synchronously on the HTTPD thread.
-    esp_err_t submit_tool(const Tool* tool, cJSON* args, cJSON* id, httpd_req_t* req);
+    esp_err_t submit_tool(const Tool* tool, cJSON* args, httpd_req_t* req);
 
     void note_request();
     void note_tool_result(bool is_error);
@@ -91,6 +92,10 @@ public:
     bool http_authorized(httpd_req_t* req);
     bool ws_authorized(httpd_req_t* req);
     std::string base_url();
+
+    // SEP 服务化:WS /events 事件通道。订阅socket由 handler 首帧注册,
+    // close_fn 注销;push_event 的每条文本都会镜像推给订阅者。
+    static void handle_ws_close(int fd);
 
 private:
     struct AsyncToolJob;
@@ -130,6 +135,15 @@ private:
     void cancel_queued_jobs();
     void stop_httpd_and_streams();
     void mark_start_failure(const std::string& message);
+
+    // /events 通道实现细节
+    static esp_err_t events_ws_handler(httpd_req_t* req);
+    static esp_err_t events_pre_handshake(httpd_req_t* req);
+    void add_event_client(int fd);
+    void remove_event_client(int fd);
+    void broadcast_event(const char* text);
+    std::mutex event_fds_mtx_;
+    std::vector<int> event_fds_;
 
     Registry registry_;
     UiHooks ui_hooks_;

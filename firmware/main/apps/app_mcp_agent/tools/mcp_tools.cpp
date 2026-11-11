@@ -5,7 +5,7 @@
  */
 // Tool implementations of the LAN MCP Agent.
 //
-// Porting note: the robot/reminder tool bodies are copied from the official
+// Porting note: the robot tool bodies are copied from the official
 // cloud tools in hal/hal_mcp.cpp (parameter ranges and semantics kept
 // identical so client prompts transfer 1:1); they were re-bound to the
 // standalone registry instead of the vendored xiaozhi McpServer.
@@ -166,46 +166,6 @@ ToolOutput ui_error()
 }
 
 // ---------------- device tools ----------------
-
-ToolOutput tool_get_device_status(const cJSON*)
-{
-    cJSON* root = cJSON_CreateObject();
-    cJSON* wifi = cJSON_CreateObject();
-    cJSON_AddBoolToObject(wifi, "connected", mcp_dev::wifi_connected());
-    cJSON_AddStringToObject(wifi, "ssid", mcp_dev::wifi_ssid().c_str());
-    cJSON_AddStringToObject(wifi, "ip", mcp_dev::wifi_ip().c_str());
-    cJSON_AddNumberToObject(wifi, "rssi", mcp_dev::wifi_rssi());
-    cJSON_AddItemToObject(root, "wifi", wifi);
-    cJSON* battery = cJSON_CreateObject();
-    cJSON_AddNumberToObject(battery, "level", GetHAL().getBatteryLevel());
-    cJSON_AddBoolToObject(battery, "charging", GetHAL().isBatteryCharging());
-    cJSON_AddItemToObject(root, "battery", battery);
-    cJSON* speaker = cJSON_CreateObject();
-    cJSON_AddNumberToObject(speaker, "volume", GetHAL().getSpeakerVolume());
-    cJSON_AddItemToObject(root, "speaker", speaker);
-    cJSON* screen = cJSON_CreateObject();
-    cJSON_AddNumberToObject(screen, "brightness", GetHAL().getBackLightBrightness());
-    cJSON_AddItemToObject(root, "screen", screen);
-    cJSON* memory = cJSON_CreateObject();
-    cJSON_AddNumberToObject(memory, "free_heap", (double)esp_get_free_heap_size());
-    cJSON_AddNumberToObject(memory, "free_psram", (double)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-    cJSON_AddItemToObject(root, "memory", memory);
-    cJSON_AddNumberToObject(root, "uptime_s", (double)(esp_timer_get_time() / 1000000LL));
-    return ok_json(root);
-}
-
-ToolOutput tool_get_system_info(const cJSON*)
-{
-    cJSON* root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "firmware_version", FIRMWARE_VERSION);
-    cJSON_AddStringToObject(root, "mcp_server_version", "1.0.0");
-    cJSON_AddStringToObject(root, "chip", "esp32s3");
-    cJSON_AddStringToObject(root, "idf_version", esp_get_idf_version());
-    cJSON_AddStringToObject(root, "mac", GetHAL().getFactoryMacString(":").c_str());
-    cJSON_AddStringToObject(root, "ip", mcp_dev::wifi_ip().c_str());
-    cJSON_AddNumberToObject(root, "mcp_port", CONFIG_MCP_AGENT_PORT);
-    return ok_json(root);
-}
 
 ToolOutput tool_set_volume(const cJSON* args)
 {
@@ -448,52 +408,6 @@ ToolOutput tool_set_led_color(LanService& service, const cJSON* args)
     return executed ? ok_text("ok") : ui_error();
 }
 
-// ---------------- reminder tools (ported from hal_mcp.cpp) ----------------
-
-ToolOutput tool_create_reminder(LanService& service, const cJSON* args)
-{
-    ToolOutput err;
-    int duration_seconds = 0;
-    std::string message;
-    bool repeat = false;
-    if (!get_int(args, "duration_seconds", &duration_seconds, &err, true, 0, 1, 86400)) return err;
-    if (!get_string(args, "message", &message, &err, false, "Time's up!", 120)) return err;
-    if (!get_bool(args, "repeat", &repeat, &err, false, false)) return err;
-
-    const int id = service.create_reminder((uint32_t)duration_seconds * 1000, message, repeat);
-    if (id < 0) {
-        return ui_error();
-    }
-    return ok_text(std::to_string(id));
-}
-
-ToolOutput tool_get_reminders(LanService& service, const cJSON*)
-{
-    cJSON* array = cJSON_CreateArray();
-    for (const auto& r : service.get_reminders()) {
-        cJSON* item = cJSON_CreateObject();
-        cJSON_AddNumberToObject(item, "id", r.id);
-        cJSON_AddNumberToObject(item, "duration_ms", (double)r.durationMs);
-        cJSON_AddStringToObject(item, "message", r.message.c_str());
-        cJSON_AddBoolToObject(item, "repeat", r.repeat);
-        cJSON_AddItemToArray(array, item);
-    }
-    cJSON* root = cJSON_CreateObject();
-    cJSON_AddItemToObject(root, "reminders", array);
-    return ok_json(root);
-}
-
-ToolOutput tool_stop_reminder(LanService& service, const cJSON* args)
-{
-    ToolOutput err;
-    int id = 0;
-    if (!get_int(args, "id", &id, &err, true, 0, -1000000, 1000000)) return err;
-    if (!service.stop_reminder(id)) {
-        return ui_error();
-    }
-    return ok_text("ok");
-}
-
 // ---------------- camera tool ----------------
 
 ToolOutput tool_take_photo(LanService& service, const cJSON* args)
@@ -548,38 +462,6 @@ std::string ws_base()
     return buf;
 }
 
-ToolOutput tool_mic_stream(const cJSON*)
-{
-    const std::string base = ws_base();
-    if (base.empty()) {
-        ToolOutput err;
-        err.is_error = true;
-        err.text     = "device is not connected to a network";
-        return err;
-    }
-    char buf[160];
-    snprintf(buf, sizeof(buf),
-             "{\"url\": \"%s/mic\", \"codec\": \"opus\", \"sample_rate\": 16000, \"channels\": 1, \"frame_ms\": 60}",
-             base.c_str());
-    return ok_text(buf);
-}
-
-ToolOutput tool_spk_stream(const cJSON*)
-{
-    const std::string base = ws_base();
-    if (base.empty()) {
-        ToolOutput err;
-        err.is_error = true;
-        err.text     = "device is not connected to a network";
-        return err;
-    }
-    char buf[160];
-    snprintf(buf, sizeof(buf),
-             "{\"url\": \"%s/speaker\", \"codec\": \"opus\", \"sample_rate\": 16000, \"channels\": 1, \"frame_ms\": 60}",
-             base.c_str());
-    return ok_text(buf);
-}
-
 // ---------------- owner tool ----------------
 
 ToolOutput tool_reboot(LanService& service, const cJSON*)
@@ -595,14 +477,6 @@ void register_all_tools(LanService& service)
 {
     auto& reg = service.registry();
 
-    reg.add({"self.get_device_status",
-             "Get device status: wifi, battery, speaker volume, screen brightness, memory, uptime.",
-             R"({})",
-             tool_get_device_status});
-    reg.add({"self.get_system_info",
-             "Get system info: firmware version, MAC, IP, MCP port.",
-             R"({})",
-             tool_get_system_info});
     reg.add({"self.audio_speaker.set_volume",
              "Set speaker volume (0-100).",
              R"({"volume":{"type":"integer","minimum":0,"maximum":100}})",
@@ -661,35 +535,11 @@ void register_all_tools(LanService& service)
              R"({"red":{"type":"integer","minimum":0,"maximum":168},"green":{"type":"integer","minimum":0,"maximum":168},"blue":{"type":"integer","minimum":0,"maximum":168}})",
              [&service](const cJSON* args) { return tool_set_led_color(service, args); }});
 
-    reg.add({"self.robot.create_reminder",
-             "Create a reminder. Duration is in seconds. Message is what to say when time is up. Set repeat to true to repeat the reminder.",
-             R"({"duration_seconds":{"type":"integer","minimum":1,"maximum":86400},"message":{"type":"string","default":"Time's up!"},"repeat":{"type":"boolean","default":false}})",
-             [&service](const cJSON* args) { return tool_create_reminder(service, args); }});
-    reg.add({"self.robot.get_reminders",
-             "Get list of active reminders.",
-             R"({})",
-             [&service](const cJSON* args) { return tool_get_reminders(service, args); }});
-    reg.add({"self.robot.stop_reminder",
-             "Stop a reminder by ID.",
-             R"({"id":{"type":"integer"}})",
-             [&service](const cJSON* args) { return tool_stop_reminder(service, args); }});
-
     reg.add({"self.camera.take_photo",
              "Capture a photo (320x240) and return its URL served by the device. Takes 0.5-1 s. "
              "Set embed=true to also inline the JPEG as base64 (larger response).",
              R"({"quality":{"type":"integer","minimum":1,"maximum":100,"default":20},"embed":{"type":"boolean","default":false}})",
              [&service](const cJSON* args) { return tool_take_photo(service, args); }});
-
-    reg.add({"self.microphone.stream",
-             "Start listening: returns a WebSocket URL streaming Opus audio (16 kHz mono 60 ms frames). "
-             "Connect, send {\"type\":\"start\"}, receive binary Opus packets, send {\"type\":\"stop\"} to end. One client at a time. No echo cancellation.",
-             R"({})",
-             tool_mic_stream});
-    reg.add({"self.speaker.stream",
-             "Returns a WebSocket URL for playing audio on the robot: send {\"type\":\"start\"}, then binary Opus packets "
-             "(16 kHz mono 60 ms, paced ~16.7 frames/s), then {\"type\":\"stop\"}. One client at a time.",
-             R"({})",
-             tool_spk_stream});
 
 #if CONFIG_MCP_AGENT_ENABLE_OWNER_TOOLS
     reg.add({"self.reboot",

@@ -59,10 +59,15 @@ public:
     void Stop();
 
     // SEP-0005: enqueue raw 60ms opus frames (same packets the WS stream
-    // accepts) from non-WS callers, e.g. the MCP tool. Starts the playback
-    // task on demand. Returns false when a WS client owns the stream or the
-    // task cannot start; err (optional) receives a short reason.
+    // accepts) from non-WS callers, e.g. the MCP tool. Returns false when a
+    // WS client owns the stream or the playback task cannot start; err
+    // (optional) receives a short reason.
     bool EnqueueOpusFrames(const std::vector<std::vector<uint8_t>>& frames, std::string* err = nullptr);
+
+    // SEP: create the persistent playback task (idempotent). Called once at
+    // service start while internal RAM is still contiguous — see
+    // PlaybackTaskImpl for why lazy creation inside a request fails.
+    bool EnsurePlaybackTask();
 
     static bool Stopped()
     {
@@ -95,9 +100,6 @@ private:
     static esp_err_t WsHandlerImpl(httpd_req_t* req);
     static void PlaybackTask(void* arg);
     static void PlaybackTaskImpl(void* arg);
-    // Creates the playback task on the first client "start" (lazy: the
-    // stack is only held while somebody streams). False when out of memory.
-    bool EnsurePlaybackTask();
 
     std::atomic<httpd_handle_t> server_{nullptr};
     mcp_lan::LanService* mcp_service_ = nullptr;
