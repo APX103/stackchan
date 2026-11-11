@@ -20,6 +20,7 @@ private:
     void* _img         = nullptr;  // lv_obj_t*
     void* _fps_label   = nullptr;  // lv_obj_t*
     uint32_t _last_ms  = 0;
+    uint32_t _reassert_ms = 0;
     uint32_t _fps_tick_ms = 0;
     uint32_t _fps_count  = 0;
 };

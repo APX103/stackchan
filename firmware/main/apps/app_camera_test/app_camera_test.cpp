@@ -118,6 +118,12 @@ void AppCameraTest::onRunning()
 
     // ~10 fps: conversion + LVGL invalidate at this pace is plenty for a test view
     const uint32_t t = now_ms();
+    // Defensive: re-assert keep-awake every 30 s (idempotent) in case any
+    // unknown path re-enables the power save timer while we run.
+    if (t - _reassert_ms >= 30000) {
+        _reassert_ms = t;
+        hal_bridge::set_power_save_user_disabled(true);
+    }
     if (t - _last_ms < 100) return;
     _last_ms = t;
 

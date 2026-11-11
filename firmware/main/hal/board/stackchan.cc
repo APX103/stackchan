@@ -344,6 +344,7 @@ public:
     void SetUserPowerSaveDisabled(bool v)
     {
         user_disable_power_save_ = v;
+        ESP_LOGI(TAG, "SetUserPowerSaveDisabled(%d) [experiment trace]", v);
         if (v && power_save_timer_ != nullptr) {
             power_save_timer_->WakeUp();
             power_save_timer_->SetEnabled(false);
