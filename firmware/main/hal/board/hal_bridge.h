@@ -64,4 +64,8 @@ uint8_t board_get_speaker_volume();
 
 void app_play_sound(const std::string_view& sound);
 
+// SEP-0005 fix: suppress/resume the idle screen-blank ("screensaver") —
+// used by the MCP.AGENT app while it stays open.
+void set_power_save_user_disabled(bool v);
+
 }  // namespace hal_bridge

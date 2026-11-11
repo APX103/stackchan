@@ -10,6 +10,7 @@
 #include <misc/lv_timer.h>
 
 #include <hal/hal.h>
+#include <hal/board/hal_bridge.h>
 #include <mooncake_log.h>
 #include <assets/assets.h>
 #include <stackchan/stackchan.h>
@@ -129,6 +130,9 @@ void AppMcpAgent::onOpen()
         _label_ip_hint->setText("");
     }
 
+    // SEP-0005 fix: keep the screen awake while the MCP app is open
+    hal_bridge::set_power_save_user_disabled(true);
+
     _service = std::make_unique<mcp_lan::LanService>();
     _service->set_ui_hooks({
         .execute = [this](const mcp_lan::LanService::UiAction& action, uint32_t timeout_ms) {
@@ -223,6 +227,7 @@ void AppMcpAgent::onSleeping()
 // No HTTPD or worker waits are allowed here.
 void AppMcpAgent::onClose()
 {
+    hal_bridge::set_power_save_user_disabled(false);
     _closing = true;
     if (_service) {
         _service->request_stop();

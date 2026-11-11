@@ -338,6 +338,20 @@ private:
 };
 
 class M5StackCoreS3Board : public WifiBoard {
+public:
+    // SEP-0005 fix: apps (e.g. MCP.AGENT) suppress the idle screen-blank
+    // while open; the power polling loop respects the flag.
+    void SetUserPowerSaveDisabled(bool v)
+    {
+        user_disable_power_save_ = v;
+        if (v && power_save_timer_ != nullptr) {
+            power_save_timer_->WakeUp();
+            power_save_timer_->SetEnabled(false);
+            last_power_save_enabled_ = false;
+        }
+        // re-enable path: leave it to the polling loop (RefreshPowerState)
+    }
+
 private:
     static constexpr int kPowerSaveSleepDelaySeconds  = 300;
     static constexpr int kPowerStatePollIntervalMs    = 1000;
@@ -361,6 +375,7 @@ private:
     esp_timer_handle_t touchpad_timer_;
     PowerSaveTimer* power_save_timer_;
     hal_bridge::XiaozhiConfig_t xiaozhi_config_;
+    bool user_disable_power_save_ = false;  // SEP-0005 fix: app-requested keep-awake
     std::mutex power_state_mutex_;
     PowerState power_state_;
     bool last_power_save_enabled_             = false;
@@ -375,7 +390,8 @@ private:
 
     void UpdatePowerSaveEnabled(bool has_external_power, bool is_discharging)
     {
-        const bool should_enable_power_save = ShouldEnablePowerSave(has_external_power, is_discharging);
+        const bool should_enable_power_save =
+            ShouldEnablePowerSave(has_external_power, is_discharging) && !user_disable_power_save_;
         if (should_enable_power_save == last_power_save_enabled_) {
             return;
         }
@@ -850,4 +866,10 @@ void hal_bridge::toggle_xiaozhi_chat_state()
         return;
     }
     app.ToggleChatState();
+}
+
+void hal_bridge::set_power_save_user_disabled(bool v)
+{
+    // Concrete board type is file-local; suppress the idle screen-blank.
+    static_cast<M5StackCoreS3Board&>(Board::GetInstance()).SetUserPowerSaveDisabled(v);
 }

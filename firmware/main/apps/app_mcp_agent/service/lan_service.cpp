@@ -287,6 +287,12 @@ bool LanService::start(std::string* err)
     photo_uri.handler = photo_handler;
     photo_uri.user_ctx = this;
 
+    // SEP: pre-initialize the audio codec while internal RAM is still
+    // plentiful (later, with avatar+service+WS all live, the preflight in
+    // codec_access refuses init at ~38KB free and play_opus would fail).
+    // codec() caches the pointer, so later callers cost nothing.
+    mcp_dev::audio_codec("mcp codec preload");
+
     const bool ok = httpd_register_uri_handler(server, &status_uri) == ESP_OK &&
                     httpd_register_uri_handler(server, &photo_uri) == ESP_OK &&
                     register_mcp_endpoint(server, *this) &&

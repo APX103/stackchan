@@ -29,7 +29,7 @@ static const char* TAG = "SpkWs";
 
 // Backlog limit while the playback task is busy: ~0.5 s of 60 ms packets.
 // Beyond that the sender is outrunning the speaker and frames are dropped.
-constexpr size_t kMaxQueuedPackets = 8;
+constexpr size_t kMaxQueuedPackets = 100;  // SEP: ~6s buffer, absorb LAN bursts
 constexpr int kFrameMs = 60;
 
 namespace {
@@ -380,10 +380,11 @@ bool SpeakerWsStream::EnsurePlaybackTask() {
     }
     running_     = true;
     task_exited_ = false;
-    // 16 KB internal stack (decode is lighter than encode; telemetry on
-    // GET /).
+    // 12 KB internal stack: decode needs far less than 16 KB and the caps
+    // allocator fails on a busy device when the largest internal block drops
+    // below the requested size (~14 KB observed). Watch spk_stack_free.
     // BYTES with WithCaps; must not be PSRAM (flash-write cache assert).
-    if (xTaskCreatePinnedToCoreWithCaps(PlaybackTask, "spk_ws", 2048 * 8, this, 4, &playback_task_, 1,
+    if (xTaskCreatePinnedToCoreWithCaps(PlaybackTask, "spk_ws", 2048 * 6, this, 4, &playback_task_, 1,
                                         MALLOC_CAP_INTERNAL) != pdPASS) {
         ESP_LOGE(TAG, "failed to create playback task: free internal=%u, largest=%u",
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
@@ -410,4 +411,32 @@ void SpeakerWsStream::Stop() {
     }
     server_ = nullptr;
     ESP_LOGI(TAG, "speaker stream stopped");
+}
+
+bool SpeakerWsStream::EnqueueOpusFrames(const std::vector<std::vector<uint8_t>>& frames, std::string* err) {
+    auto fail = [err](const char* why) {
+        if (err != nullptr) *err = why;
+        ESP_LOGW(TAG, "EnqueueOpusFrames rejected: %s", why);
+        return false;
+    };
+    if (frames.empty()) return fail("no frames");
+    if (IsActive()) return fail("a websocket client owns the speaker stream");
+    if (!EnsurePlaybackTask()) return fail("playback task unavailable (codec busy or no memory)");
+
+    size_t queued = 0, dropped = 0;
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        for (const auto& f : frames) {
+            if (f.empty()) continue;
+            if (packet_queue_.size() >= kMaxQueuedPackets) {
+                ++dropped;
+                continue;
+            }
+            packet_queue_.push_back(std::make_shared<std::vector<uint8_t>>(f));
+            ++queued;
+        }
+    }
+    queue_cv_.notify_all();
+    ESP_LOGI(TAG, "MCP play_opus: %u frames queued (%u dropped)", (unsigned)queued, (unsigned)dropped);
+    return queued > 0;
 }

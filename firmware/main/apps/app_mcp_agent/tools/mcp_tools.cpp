@@ -25,6 +25,8 @@
 #include "../platform/device_access.h"
 #include "../service/lan_service.h"
 #include "mcp_photo.h"
+#include "../audio/speaker_ws_stream.h"
+#include <mbedtls/base64.h>
 #include "../protocol/mcp_registry.h"
 #include <stackchan/avatar/avatar.h>
 #include <stackchan/stackchan.h>
@@ -223,6 +225,58 @@ ToolOutput tool_set_volume(const cJSON* args)
     }
     return ok_text("ok");
 }
+// ---------------- SEP: opus over MCP (agent-style audio feed) ----------------
+
+ToolOutput tool_play_opus(const cJSON* args)
+{
+    ToolOutput err;
+    const cJSON* frames = cJSON_GetObjectItemCaseSensitive(args, "frames_base64");
+    if (!cJSON_IsArray(frames) || cJSON_GetArraySize(frames) == 0) {
+        err.is_error = true;
+        err.text     = "missing required argument: frames_base64 (array of base64 opus frames, 16kHz mono 60ms)";
+        return err;
+    }
+    std::vector<std::vector<uint8_t>> decoded;
+    size_t bad = 0;
+    cJSON* item = nullptr;
+    cJSON_ArrayForEach(item, frames)
+    {
+        if (!cJSON_IsString(item) || item->valuestring == nullptr) {
+            ++bad;
+            continue;
+        }
+        const size_t in_len = strlen(item->valuestring);
+        size_t need         = 0;
+        const int probe     = mbedtls_base64_decode(nullptr, 0, &need, (const uint8_t*)item->valuestring, in_len);
+        // probe 阶段: BUFFER_TOO_SMALL 且给出 need = 合法;其余(含 INVALID)跳过
+        const bool probe_ok = (probe == 0 || probe == MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL) && need > 0;
+        if (!probe_ok) {
+            ++bad;
+            continue;
+        }
+        std::vector<uint8_t> buf(need);
+        if (mbedtls_base64_decode(buf.data(), buf.size(), &need, (const uint8_t*)item->valuestring, in_len) != 0) {
+            ++bad;
+            continue;
+        }
+        decoded.push_back(std::move(buf));
+    }
+    if (decoded.empty()) {
+        err.is_error = true;
+        err.text     = "all frames failed to decode";
+        return err;
+    }
+    std::string why;
+    if (!SpeakerWsStream::GetInstance().EnqueueOpusFrames(decoded, &why)) {
+        err.is_error = true;
+        err.text     = why;
+        return err;
+    }
+    char buf[96];
+    snprintf(buf, sizeof(buf), "{\"queued\": %zu, \"invalid\": %zu}", decoded.size(), bad);
+    return ok_text(buf);
+}
+
 
 ToolOutput tool_get_screen_info(const cJSON*)
 {
@@ -553,6 +607,13 @@ void register_all_tools(LanService& service)
              "Set speaker volume (0-100).",
              R"({"volume":{"type":"integer","minimum":0,"maximum":100}})",
              tool_set_volume});
+    reg.add({"self.audio_speaker.play_opus",
+             "Play audio on the robot's speaker. Pass raw Opus frames (16 kHz mono 60 ms, the same packets "
+             "the /speaker websocket accepts) as base64 strings; frames play in order through the native "
+             "playback pipeline. Keep each call under ~150 frames (HTTP body limit); send several calls "
+             "for longer clips.",
+             R"({"frames_base64":{"type":"array","items":{"type":"string"},"minItems":1}})",
+             tool_play_opus});
     reg.add({"self.screen.get_info",
              "Get screen info.",
              R"({})",

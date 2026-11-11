@@ -58,6 +58,12 @@ public:
     // Disconnects the client and stops playback before HTTPD is stopped.
     void Stop();
 
+    // SEP-0005: enqueue raw 60ms opus frames (same packets the WS stream
+    // accepts) from non-WS callers, e.g. the MCP tool. Starts the playback
+    // task on demand. Returns false when a WS client owns the stream or the
+    // task cannot start; err (optional) receives a short reason.
+    bool EnqueueOpusFrames(const std::vector<std::vector<uint8_t>>& frames, std::string* err = nullptr);
+
     static bool Stopped()
     {
         auto& self = GetInstance();
