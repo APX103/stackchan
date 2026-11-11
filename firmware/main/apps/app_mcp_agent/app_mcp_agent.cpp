@@ -8,6 +8,7 @@
 #include <sdkconfig.h>
 #include <esp_system.h>
 #include <misc/lv_timer.h>
+#include <lvgl.h>
 
 #include <hal/hal.h>
 #include <hal/board/hal_bridge.h>
@@ -176,6 +177,16 @@ void AppMcpAgent::onOpen()
 
 void AppMcpAgent::onRunning()
 {
+    // SEP: 喂 Launcher 屏保活跃信号(每 10s,无触摸副作用),App 期间屏保不触发
+    {
+        static uint32_t last_feed_ms = 0;
+        const uint32_t now           = GetHAL().millis();
+        if (now - last_feed_ms >= 10000) {
+            last_feed_ms = now;
+            lv_display_trigger_activity(NULL);
+        }
+    }
+
     if (_closing) {
         if (!_service || _service->stopped()) {
             if (_service) {

@@ -104,6 +104,11 @@ void AppLauncher::create_launcher_view()
 
 void AppLauncher::screensaver_update()
 {
+    // SEP: DVD screensaver disabled by user request (2026-11-11). It keys off
+    // global LVGL input inactivity and overlays whatever app is running.
+    // Re-enable by removing this early return.
+    return;
+
     const uint32_t SCREENSAVER_TIMEOUT_MS = 30000;
 
     uint32_t idle_time = lv_display_get_inactive_time(NULL);

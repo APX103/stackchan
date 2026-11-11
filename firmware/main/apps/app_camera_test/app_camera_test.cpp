@@ -125,6 +125,9 @@ void AppCameraTest::onRunning()
     if (t - _reassert_ms >= 10000) {
         _reassert_ms = t;
         hal_bridge::set_power_save_user_disabled(true);
+        // Launcher DVD 屏保按 LVGL 输入不活跃计时;喂活跃信号(无触摸副作用),
+        // 使取景期间屏保不触发(阈值 30s,10s 一喂余量充足)
+        lv_display_trigger_activity(NULL);
     }
     if (t - _last_ms < 100) return;
     _last_ms = t;
