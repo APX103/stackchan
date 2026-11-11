@@ -13,3 +13,4 @@
 #include "app_ezdata/app_ezdata.h"
 #include "app_dance/app_dance.h"
 #include "app_mcp_agent/app_mcp_agent.h"  // SEP-0005: LAN MCP server
+#include "app_camera_test/app_camera_test.h"  // SEP-0008: camera preview

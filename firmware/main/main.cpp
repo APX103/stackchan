@@ -47,6 +47,8 @@ extern "C" void app_main(void)
         GetMooncake().installApp(std::make_unique<AppSetup>());
         // SEP-0005: LAN MCP server app
         GetMooncake().installApp(std::make_unique<AppMcpAgent>());
+        // SEP-0008: camera preview app
+        GetMooncake().installApp(std::make_unique<AppCameraTest>());
 
         // SEP-0002: automation console + http api (launch app by name)
         sep::init();
