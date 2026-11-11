@@ -25,15 +25,20 @@ static uint32_t now_ms()
     return (uint32_t)(esp_timer_get_time() / 1000);
 }
 
-// YUYV(YUV422 packed) -> RGB565, two pixels per iteration.
-static void yuyv_to_rgb565(const uint8_t* src, uint16_t* dst, int w, int h)
+// v4l2 fourcc
+#define SEP_V4L2_PIX_FMT_YUYV 0x56595559
+#define SEP_V4L2_PIX_FMT_UYVY 0x59565955
+
+// YUV422 packed -> RGB565, two pixels per iteration.
+// 该相机实际给 UYVY(U Y0 V Y1);早先按 YUYV 解,黑场变绿/亮场变紫。
+static void yuv422_to_rgb565(const uint8_t* src, uint16_t* dst, int w, int h, bool is_uyvy)
 {
     const size_t pixels = (size_t)w * h;
     for (size_t i = 0; i < pixels; i += 2) {
-        const int y0 = src[i * 2 + 0];
-        const int u  = src[i * 2 + 1] - 128;
-        const int y1 = src[i * 2 + 2];
-        const int v  = src[i * 2 + 3] - 128;
+        const int y0 = src[i * 2 + (is_uyvy ? 1 : 0)];
+        const int u  = src[i * 2 + (is_uyvy ? 0 : 1)] - 128;
+        const int y1 = src[i * 2 + (is_uyvy ? 3 : 2)];
+        const int v  = src[i * 2 + (is_uyvy ? 2 : 3)] - 128;
 
         int r = y0 + (91881 * v >> 16);
         int g = y0 - ((22554 * u + 46802 * v) >> 16);
@@ -66,6 +71,8 @@ AppCameraTest::AppCameraTest()
 void AppCameraTest::onOpen()
 {
     mclog::tagInfo(getAppInfo().name, "on open");
+    // 取景页保持常亮(复用 SEP-0005 的息屏抑制)
+    hal_bridge::set_power_save_user_disabled(true);
 
     auto camera = hal_bridge::board_get_camera();
     const int w = camera ? camera->GetFrameWidth() : 0;
@@ -121,8 +128,10 @@ void AppCameraTest::onRunning()
         auto frame_lock = camera->TryLockFrame();
         if (!frame_lock.owns_lock()) return;
         if (!camera->StreamCaptures()) return;
-        yuyv_to_rgb565(camera->GetFrameData(), (uint16_t*)_rgb565,
-                       camera->GetFrameWidth(), camera->GetFrameHeight());
+        const uint32_t fmt = (uint32_t)camera->GetFrameFormat();
+        const bool is_uyvy = (fmt != SEP_V4L2_PIX_FMT_YUYV);  // UYVY 及未知格式按 UYVY
+        yuv422_to_rgb565(camera->GetFrameData(), (uint16_t*)_rgb565,
+                         camera->GetFrameWidth(), camera->GetFrameHeight(), is_uyvy);
     }
 
     {
@@ -142,6 +151,7 @@ void AppCameraTest::onRunning()
 void AppCameraTest::onClose()
 {
     mclog::tagInfo(getAppInfo().name, "on close, %" PRIu32 " frames shown", _frames);
+    hal_bridge::set_power_save_user_disabled(false);
 
     {
         LvglLockGuard lock;
