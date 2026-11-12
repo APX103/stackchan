@@ -20,6 +20,8 @@
 
 #include "platform/device_access.h"
 #include "service/lan_service.h"
+#include "audio/mic_ws_stream.h"
+#include "audio/speaker_ws_stream.h"
 
 using namespace mooncake;
 using namespace smooth_ui_toolkit::lvgl_cpp;
@@ -80,6 +82,14 @@ void AppMcpAgent::onOpen()
 
     mclog::tagInfo(getAppInfo().name, "on open");
     _opened_once = true;
+
+    // SEP 2026-11-12:在 avatar/LVGL/UI 分配之前预建两个音频任务(22K+12K
+    // 连续栈)。放在 App 打开的第一时刻——开机此刻 internal RAM 还有 ~136K,
+    // 而 LanService 启动时(WiFi 就绪后)常只剩 ~30K、最大连续块可能低于
+    // mic 的 22.5K(实测 19456),预建失败则整个开机的麦克风都不可用。
+    // 任务无会话时只驻留栈,编解码器/codec 总线仍按需懒获取。
+    MicWsStream::GetInstance().EnsureCaptureTask();
+    SpeakerWsStream::GetInstance().EnsurePlaybackTask();
 
     {
         LvglLockGuard lock;

@@ -71,9 +71,10 @@ public:
 
     static bool Stopped()
     {
+        // SEP 常驻任务语义(与 MicWsStream 一致):任务活着≠未停止。
         auto& self = GetInstance();
-        return self.server_ == nullptr &&
-               (self.playback_task_ == nullptr || self.task_exited_.load());
+        return self.server_ == nullptr && self.client_fd_.load() < 0 &&
+               !self.session_busy_.load();
     }
     static void Reclaim();
 
@@ -117,4 +118,5 @@ private:
     // Socket of the active playback client; -1 while idle. Claimed via
     // compare_exchange so exactly one client wins.
     std::atomic<int> client_fd_{-1};
+    std::atomic<bool> session_busy_{false};  // decoder/codec-output 会话进行中
 };

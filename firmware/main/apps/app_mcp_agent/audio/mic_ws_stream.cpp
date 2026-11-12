@@ -281,6 +281,7 @@ void MicWsStream::CaptureTaskImpl(void* arg) {
             mcp_audio::release_output(codec);
             bus_acquired = false;
         }
+        self.session_busy_.store(false);
     };
     // One-shot progress logs: enough to tell where the pipeline stalls
     // without flooding the console.
@@ -330,11 +331,13 @@ void MicWsStream::CaptureTaskImpl(void* arg) {
                 codec->Start();
             }
             bus_acquired = true;
+            self.session_busy_.store(true);
 
-            // The I2S stream is interleaved stereo: slot 0 = microphone,
-            // slot 1 = playback reference (measured: [mic, -2, mic, -2...]).
-            // Effective mic rate is the configured 24 kHz (1440 mic samples
-            // arrive every 60 ms inside 2880 interleaved samples).
+            // SEP 2026-11-12 终审定案(1kHz 音 + 256 样本分相位能量实测):
+            // DMA 2-slot 交错 [参考通道, 麦克风] @48k 总率,即每槽 24k
+            //(=配置值)。麦克风在奇数索引(offset1/3 peak~31k,偶数位只有
+            // 参考串音 ~4k/静音)。旧代码取偶数位 = 从第一天起就取错了
+            // 通道:ASR 乱码(いや、わ)、唤醒词永不命中皆源于此。
             const uint32_t in_rate_config = codec->input_sample_rate();
             need_resample = in_rate_config != kOpusSampleRate;
             if (need_resample) {
@@ -383,6 +386,7 @@ void MicWsStream::CaptureTaskImpl(void* arg) {
             frame_samples = frame_bytes / sizeof(int16_t);  // 960 @ 60 ms
 
             // One 60 ms chunk at the codec rate, both interleaved slots.
+            // 一个读取块 = 60ms 的 2-slot 交错全量样本
             const size_t in_chunk = in_rate_config / 1000 * kFrameMs * 2;
             in_buf.assign(in_chunk, 0);
             mic_buf.assign(in_chunk / 2, 0);  // de-interleaved mic channel
@@ -392,7 +396,7 @@ void MicWsStream::CaptureTaskImpl(void* arg) {
             enc_buf.assign(out_bytes, 0);
 
             if (!logged_session) {
-                ESP_LOGI(TAG, "capture session ready (in %lu Hz interleaved stereo, resample %d, opus %d samples/frame)",
+                ESP_LOGI(TAG, "capture session ready (2-slot in %lu Hz, mic=ch0(even), resample %d, opus %d samples/frame)",
                          (unsigned long)in_rate_config, need_resample, (int)frame_samples);
                 logged_session = true;
             }
@@ -410,11 +414,14 @@ void MicWsStream::CaptureTaskImpl(void* arg) {
         stat_reads++;
         stat_tick += kFrameMs;
 
-        // De-interleave: keep slot 0 (mic), drop slot 1 (playback
-        // reference, a constant DC when idle). The board's hardware input
-        // gain path is ineffective on this codec stack (measured peak
-        // ~241), so apply a fixed digital gain (x16 = +24 dB) with
-        // saturation to reach usable levels.
+        // De-interleave: 2-slot 交错 [麦克风(ch0), 回采参考(ch1)],取偶数位。
+        // 2026-11-12 晚定案(真声判据):奇数槽在用户说话时峰值 0.002(死静音
+        // =参考通道,只在喇叭播放时有电信号),偶数槽承载真人声(实测峰值
+        // 0.4~0.76)。早先的 1kHz 分相位实验把参考通道误判为麦克风——因为
+        // 测试音在播,参考通道电气直通自然最强。
+        // Hardware input gain is ineffective on this codec stack (measured
+        // peak ~241), so apply fixed digital gain (x16 = +24 dB) with
+        // saturation.
         const size_t mic_samples = in_buf.size() / 2;
         for (size_t i = 0; i < mic_samples; i++) {
             int32_t v = (int32_t)in_buf[i * 2] * kMicDigitalGain;
@@ -440,7 +447,7 @@ void MicWsStream::CaptureTaskImpl(void* arg) {
         }
 
         if (stat_tick >= 10000) {
-            ESP_LOGI(TAG, "stats: reads=%u produced=%u frames=%u (expect reads~167 produced~16000 frames~167 per 10s)",
+            ESP_LOGI(TAG, "stats: reads=%u produced=%u frames=%u (2-slot odd: expect reads~167 produced~16000 frames~167 per 10s)",
                      stat_reads, stat_produced, stat_frames);
             stat_tick = 0; stat_reads = 0; stat_produced = 0; stat_frames = 0;
         }
@@ -570,9 +577,8 @@ void MicWsStream::Stop() {
     }
     session_++;
     client_fd_ = -1;
-    running_ = false;
-    // The capture task owns its encoder and codec cleanup. It is reclaimed
-    // by EnsureCaptureTask only after task_exited_ becomes true.
+    // SEP 常驻任务:服务停止不杀任务(预建于 App 打开,内存最充裕时),
+    // 只卸载服务端;进行中的会话由任务在空闲宽限后自行释放。
     server_ = nullptr;
     ESP_LOGI(TAG, "microphone stream stopped");
 }

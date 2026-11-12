@@ -99,6 +99,7 @@ void SpeakerWsStream::PlaybackTaskImpl(void* arg) {
                         mcp_audio::release_output(codec);
                         output_acquired = false;
                     }
+                    self.session_busy_.store(false);
                     ESP_LOGI(TAG, "playback idle: decoder/output released");
                 }
                 continue;  // idle tick: re-check running_
@@ -126,6 +127,7 @@ void SpeakerWsStream::PlaybackTaskImpl(void* arg) {
                 codec->Start();
             }
             output_acquired = true;
+            self.session_busy_.store(true);
             // Opus frame of 60 ms at the codec output rate (24 kHz -> 1440
             // samples); sized once the codec is known.
             frame_samples = codec->output_sample_rate() / 1000 * kFrameMs;
@@ -179,6 +181,7 @@ void SpeakerWsStream::PlaybackTaskImpl(void* arg) {
     if (output_acquired) {
         mcp_audio::release_output(codec);
     }
+    self.session_busy_.store(false);
     ESP_LOGI(TAG, "playback task stopped (%u packets played)", (unsigned)played);
 }
 
@@ -421,7 +424,8 @@ void SpeakerWsStream::Stop() {
         return;
     }
     client_fd_ = -1;
-    running_ = false;
+    // SEP 常驻任务:服务停止不杀任务,只卸载服务端与客户端;进行中的
+    // 播放会话由任务在空闲宽限后自行释放(decoder/output)。
     queue_cv_.notify_all();
     // The playback task owns decoder and codec cleanup. It is reclaimed by
     // EnsurePlaybackTask only after task_exited_ becomes true.

@@ -57,9 +57,10 @@ public:
     // the codec and its WithCaps stack has been reclaimed.
     static bool Stopped()
     {
+        // SEP 常驻任务语义:任务活着≠未停止;服务生命周期只关心
+        //「无服务端挂载 + 无进行中的采集会话」(会话在空闲宽限后释放)。
         auto& self = GetInstance();
-        return self.server_ == nullptr &&
-               (self.capture_task_ == nullptr || self.task_exited_.load());
+        return self.server_ == nullptr && !self.session_busy_.load();
     }
     static void Reclaim();
 
@@ -109,4 +110,5 @@ private:
     // compare_exchange so exactly one client wins.
     std::atomic<int> client_fd_{-1};
     std::atomic<uint64_t> session_{0};
+    std::atomic<bool> session_busy_{false};  // codec/encoder 会话进行中
 };
